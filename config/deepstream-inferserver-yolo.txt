@@ -1,0 +1,38 @@
+infer_config {
+  unique_id: 1
+  max_batch_size: 8
+
+  backend {
+    triton {
+      model_name: "yolo_ensemble"
+      version: -1
+      model_repo {
+        root: "/app/models"
+      }
+    }
+  }
+
+  preprocess {
+    network_format: IMAGE_FORMAT_RGB
+    tensor_order: TENSOR_ORDER_LINEAR
+    normalize {
+      scale_factor: 0.003921569
+    }
+  }
+
+  custom_lib {
+    path: "/app/lib/custom_parser/libcustom_parser.so"
+  }
+
+  postprocess {
+    labelfile_path: "/app/config/labels.txt"
+    detection {
+      num_detected_classes: 80
+      custom_parse_bbox_func: "NvDsInferParseCustomTritonYolo"
+    }
+  }
+}
+
+input_control {
+  process_mode: PROCESS_MODE_FULL_FRAME
+}

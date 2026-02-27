@@ -1,0 +1,5 @@
+alembic>=1.8.0
+SQLAlchemy>=1.4.0
+# torch cu 13.0
+# rrdetr>=1.4.0
+onnxscript>=0.6.0

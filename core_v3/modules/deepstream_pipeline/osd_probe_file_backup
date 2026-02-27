@@ -1,0 +1,95 @@
+# Already works for corner line and thin box around person (for prototyping)
+def _osd_probe(self, pad, info, user_data):
+    buf = info.get_buffer()
+    if not buf:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+    l_frame = batch_meta.frame_meta_list
+
+    while l_frame:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        l_obj = frame_meta.obj_meta_list
+
+        while l_obj:
+            try:
+                obj = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+
+            # 🎯 Apply only for PERSON
+            if obj.class_id == 0:
+                
+                # Remove text completely
+                obj.text_params.display_text = ""
+
+                # Disable text background
+                obj.text_params.set_bg_clr = 0
+
+                # Optional: make font size zero (extra safety)
+                obj.text_params.font_params.font_size = 0
+
+                r = obj.rect_params
+                x = int(r.left)
+                y = int(r.top)
+                w = int(r.width)
+                h = int(r.height)
+
+                # ───────── Base Thin Neutral Rectangle ─────────
+                r.border_width = 2
+                r.border_color.set(0.7, 0.7, 0.7, 1)  # Light gray, semi-opaque
+
+                # ───────── Corner Overlay ─────────
+                corner_len = min(int(w * 0.15), 25)  # Shorter corners
+                thickness = 4
+
+                display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                display_meta.num_lines = 8
+                lines = display_meta.line_params
+
+                # Cyan highlight
+                for i in range(8):
+                    lines[i].line_width = thickness
+                    lines[i].line_color.set(0.0, 0.7, 1.0, 1.0)
+
+                # Top-left
+                lines[0].x1, lines[0].y1 = x, y
+                lines[0].x2, lines[0].y2 = x + corner_len, y
+                lines[1].x1, lines[1].y1 = x, y
+                lines[1].x2, lines[1].y2 = x, y + corner_len
+
+                # Top-right
+                lines[2].x1, lines[2].y1 = x + w, y
+                lines[2].x2, lines[2].y2 = x + w - corner_len, y
+                lines[3].x1, lines[3].y1 = x + w, y
+                lines[3].x2, lines[3].y2 = x + w, y + corner_len
+
+                # Bottom-left
+                lines[4].x1, lines[4].y1 = x, y + h
+                lines[4].x2, lines[4].y2 = x + corner_len, y + h
+                lines[5].x1, lines[5].y1 = x, y + h
+                lines[5].x2, lines[5].y2 = x, y + h - corner_len
+
+                # Bottom-right
+                lines[6].x1, lines[6].y1 = x + w, y + h
+                lines[6].x2, lines[6].y2 = x + w - corner_len, y + h
+                lines[7].x1, lines[7].y1 = x + w, y + h
+                lines[7].x2, lines[7].y2 = x + w, y + h - corner_len
+
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK

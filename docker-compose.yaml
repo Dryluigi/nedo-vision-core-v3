@@ -1,0 +1,91 @@
+version: "3.9"
+
+services:
+  deepstream-core-v3:
+    image: nvcr.io/nvidia/deepstream:7.0-triton-multiarch
+    container_name: deepstream-7-dev-core-v3
+    runtime: nvidia
+    privileged: true
+    network_mode: host
+
+    devices:
+      - nvidia.com/gpu=all
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+
+    volumes:
+      # Project source
+      - .:/app
+
+      - /mnt/linux-data/nedo-vision/venv-core-v3:/venv
+
+      - /mnt/linux-data/nedo-vision/data:/data
+
+      # X11 (optional, for GUI / EGL sink)
+      - /tmp/.X11-unix:/tmp/.X11-unix
+
+      # Cache (pip, build, etc)
+      - ./cache:/root/.cache
+
+    working_dir: /app
+    stdin_open: true
+    tty: true
+
+    command: bash
+
+  tritonserver-core-v3:
+    image: triton-23-with-torch:latest
+    build:
+      context: .
+      dockerfile: triton.Dockerfile
+    container_name: tritonserver-core-v3
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Ports
+    ports:
+      - "8005:8000" # HTTP
+      - "8006:8001" # gRPC
+      - "8007:8002" # Metrics
+
+    # Volumes - mount your model repository
+    volumes:
+      - ./models:/models
+      - ./logs:/logs
+
+    # Command to start Triton
+    command: tritonserver --model-repository=/models --log-verbose=1
+
+    # Environment variables (optional)
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Use host network for better performance (optional)
+    # network_mode: host
+
+    devices:
+      - nvidia.com/gpu=all
+
+    shm_size: "2gb" # Shared memory size for model loading
