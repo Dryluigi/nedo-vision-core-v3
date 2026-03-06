@@ -4,12 +4,12 @@ import queue
 from typing import Dict
 
 import pyds
-from gi.repository import Gst, GLib
+from gi.repository import Gst
 
 from .constant import PIPELINE_STATUS_RUNNING, PIPELINE_STATUS_STARTING, PIPELINE_STATUS_STOPPED, PIPELINE_STATUS_STOPPING
 from .deepstream_pipeline_interface import DeepstreamPipelineInterface
+from ..triton_model_manager.triton_model_manager import TritonModelManager
 
-import uuid
 import time
 
 class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
@@ -20,10 +20,14 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         pipeline_name: str,
         update_event_queue: queue.Queue,
         rtsp_url: str,
+        triton_model_manager: TritonModelManager,
         rtmp_location: str = "rtmp://host.containers.internal:1935/live/cctv-5",
         output_width: int = 1280,
         output_height: int = 720,
     ):
+        self._triton_model_manager = triton_model_manager
+
+        self._play_thread = None
         self._is_playing = False
         self._status = PIPELINE_STATUS_STOPPED
         self._first_frame_sent = False
@@ -67,14 +71,27 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             "config-file-path",
             "/app/config/deepstream-inferserver-yolo.txt"
         )
-        self.pgie.set_property("interval", 0)
+        self.pgie.set_property("interval", 5)
 
         self.tracker = Gst.ElementFactory.make("nvtracker", "tracker")
         self.tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
         self.tracker.set_property("ll-config-file", "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")
 
         self.conv = Gst.ElementFactory.make("nvvideoconvert", "conv")
+
+        self.conv_caps = Gst.ElementFactory.make("capsfilter", "conv-caps")
+        self.conv_caps.set_property("caps", Gst.Caps.from_string(
+            "video/x-raw(memory:NVMM), format=RGBA"
+        ))
+
         self.osd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
+        self.osd.set_property("process-mode", 0)
+
+        self.enc_conv = Gst.ElementFactory.make("nvvideoconvert", "enc-conv")
+        self.enc_caps = Gst.ElementFactory.make("capsfilter", "enc-caps")
+        self.enc_caps.set_property("caps", Gst.Caps.from_string(
+            "video/x-raw(memory:NVMM), format=I420"
+        ))
 
         self.encoder = Gst.ElementFactory.make("nvv4l2h264enc", "h264-encoder")
         self.encoder.set_property("bitrate", 4000000)
@@ -103,7 +120,10 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             self.pgie,
             self.tracker,
             self.conv,
+            self.conv_caps,
             self.osd,
+            self.enc_conv,
+            self.enc_caps,
             self.encoder,
             self.h264parse,
             self.flvmux,
@@ -118,8 +138,11 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self.pgie_queue.link(self.pgie)
         self.pgie.link(self.tracker)
         self.tracker.link(self.conv)
-        self.conv.link(self.osd)
-        self.osd.link(self.encoder)
+        self.conv.link(self.conv_caps)      # ← add
+        self.conv_caps.link(self.osd)       # ← change from conv.link(self.osd)
+        self.osd.link(self.enc_conv)
+        self.enc_conv.link(self.enc_caps)
+        self.enc_caps.link(self.encoder)
         self.encoder.link(self.h264parse)
         self.h264parse.link(self.flvmux)
         self.flvmux.link(self.rtmpsink)
@@ -202,11 +225,11 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             "Pipeline is starting"
         )
 
+        # Build pipeline
         self._source_bin = self._create_rtsp_source_bin(
             self._rtsp_url,
             0
         )
-
 
         self._pipeline.add(self._source_bin)
 
@@ -214,13 +237,20 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         src_pad = self._source_bin.get_static_pad("src")
         src_pad.link(sink_pad)
 
-        self._source_bin.sync_state_with_parent()
+        self._play_thread = threading.Thread(target=self._play_background)
+        self._play_thread.start()
 
+    def _play_background(self):
+        self._triton_model_manager.request_model_access(self._pipeline_id, "yolo")
+
+        self._triton_model_manager.wait_model_till_ready("yolo")
+
+        self._source_bin.sync_state_with_parent()
         self._pipeline.set_state(Gst.State.PLAYING)
 
         self._is_playing = True
 
-        print(f"Publishing at {self._rtmp_location}")
+        print(f"[INFO]  Pipeline started → {self._rtmp_location}")
 
     # -------------------------------------------------
     # STOP
@@ -282,7 +312,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
                 PIPELINE_STATUS_STOPPED,
                 f"Pipeline error: {err}"
             )
-                    
+
             self.stop()
 
         elif t == Gst.MessageType.EOS:
@@ -360,7 +390,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
                     # ───────── Corner Overlay ─────────
                     corner_len = min(int(w * 0.15), 25)
-                    thickness = 5
+                    thickness = 4
 
                     display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
                     display_meta.num_lines = 8
@@ -472,7 +502,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
                     texts[1].x_offset = safe_offset(base_x, frame_w - 1)
                     texts[1].y_offset = safe_offset(base_y, frame_h - 1)
                     texts[1].font_params.font_name = "Serif"
-                    texts[1].font_params.font_size = 12
+                    texts[1].font_params.font_size = 6
                     texts[1].font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
                     texts[1].set_bg_clr = 0
 
@@ -484,7 +514,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
                     texts[2].x_offset = safe_offset(x + w - approx_text_width + 8, frame_w - 1)
                     texts[2].y_offset = safe_offset(base_y, frame_h - 1)
                     texts[2].font_params.font_name = "Serif"
-                    texts[2].font_params.font_size = 12
+                    texts[2].font_params.font_size = 6
                     texts[2].font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
                     texts[2].set_bg_clr = 0
 

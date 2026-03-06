@@ -7,6 +7,7 @@ from ..source_sync_notifier.source_sync_notifier_interface import SourceSyncNoti
 from ..deepstream_pipeline.file_deepstream_pipeline import FileDeepstreamPipeline
 from ..deepstream_pipeline.live_deepstream_pipeline import LiveRtspDeepstreamPipeline
 from ..deepstream_pipeline.constant import PIPELINE_STATUS_RUNNING, PIPELINE_STATUS_STARTING, PIPELINE_STATUS_STOPPED, PIPELINE_STATUS_STOPPING
+from ..triton_model_manager.triton_model_manager import TritonModelManager
 from ...repositories.WorkerSourcePipelineRepository import WorkerSourcePipelineRepository
 from ...repositories.WorkerSourceRepository import WorkerSourceRepository
 from ...utils.RTMPUrl import RTMPUrl
@@ -17,13 +18,15 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             deepstream_pipelines_update_queue: queue.Queue,
             pipeline_sync_service: PipelineSyncService,
             pipeline_repository: WorkerSourcePipelineRepository,
-            source_repository: WorkerSourceRepository
+            source_repository: WorkerSourceRepository,
+            triton_model_manager: TritonModelManager,
         ):
         self._pipelines = {}
         self._deepstream_pipelines_update_queue = deepstream_pipelines_update_queue
         self._pipeline_sync_service = pipeline_sync_service
         self._pipeline_repository = pipeline_repository
         self._source_repository = source_repository
+        self._triton_model_manager = triton_model_manager
         self._update_status_listener_thread = None
 
         self._start_status_update_listener()
@@ -39,7 +42,6 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         if not pipeline:
             return
 
-
         # Create deepstream pipeline
         if source.type_code == "live":
             pipeline = LiveRtspDeepstreamPipeline(
@@ -47,6 +49,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 f"{pipeline.name}",
                 self._deepstream_pipelines_update_queue,
                 source.url,
+                self._triton_model_manager,
                 RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}")
             )
 
@@ -55,13 +58,15 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             file_url = source.file_path
             if not file_url.startswith("file://"):
                 file_url = "file://" + file_url
+
             pipeline = FileDeepstreamPipeline(
                 pipeline.id,
                 f"{pipeline.name}",
                 self._deepstream_pipelines_update_queue,
                 file_url,
                 "/app/config/deepstream-inferserver-yolo.txt",
-                RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}")
+                RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}"),
+                self._triton_model_manager
             )
 
             self._pipelines[pipeline_id] = pipeline
@@ -71,6 +76,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
 
     def stop(self, pipeline_id: str):
         self._pipelines[pipeline_id].stop()
+        del self._pipelines[pipeline_id]
 
     def restart(self, pipeline_id: str):
         pass

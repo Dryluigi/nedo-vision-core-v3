@@ -1,3 +1,4 @@
+import threading
 import queue
 import time
 from typing import Dict
@@ -12,6 +13,7 @@ from .constant import (
     PIPELINE_STATUS_STOPPING,
 )
 from .deepstream_pipeline_interface import DeepstreamPipelineInterface
+from ..triton_model_manager.triton_model_manager import TritonModelManager
 
 # TODO: add icon on top of bounding box
 
@@ -25,10 +27,11 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         file_uri: str,
         infer_config: str,
         rtmp_uri: str,
+        triton_model_manager: TritonModelManager,
         output_width: int = 1280,
         output_height: int = 720,
         target_fps: int = 30,
-        encode_bitrate: int = 4000,
+        encode_bitrate: int = 2000,
         gpu_id: int = 0,
     ):
         self.pipeline_id    = pipeline_id
@@ -41,10 +44,18 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self.target_fps     = target_fps
         self.encode_bitrate = encode_bitrate
         self.gpu_id         = gpu_id
+        self.triton_model_manager = triton_model_manager
 
         self._update_event_queue = update_event_queue
         self._status             = PIPELINE_STATUS_STOPPED
         self._first_frame_sent   = False
+        
+        self._osd_pad = None
+        self._h264_src_pad = None
+        self._first_frame_probe_id = None
+        self._osd_probe_id = None
+
+        self._play_thread = None
 
         self._pipeline = self._build_pipeline()
 
@@ -57,6 +68,14 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
     def play(self):
         self._publish_status(PIPELINE_STATUS_STARTING, "Pipeline is starting")
 
+        self._play_thread = threading.Thread(target=self._play_background)
+        self._play_thread.start()
+
+    def _play_background(self):
+        self.triton_model_manager.request_model_access(self.pipeline_id, "yolo")
+
+        self.triton_model_manager.wait_model_till_ready("yolo")
+
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             self._publish_status(PIPELINE_STATUS_STOPPED, "Pipeline failed to start")
@@ -66,9 +85,16 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
 
     def stop(self):
         self._publish_status(PIPELINE_STATUS_STOPPING, "Pipeline is stopping")
+        
+        if self._osd_probe_id:
+            self._osd_pad.remove_probe(self._osd_probe_id)
+
+        if self._first_frame_probe_id:
+            self._h264_src_pad.remove_probe(self._first_frame_probe_id)
 
         self._pipeline.send_event(Gst.Event.new_eos())
         self._pipeline.set_state(Gst.State.NULL)
+        self.triton_model_manager.release_model_access(self.pipeline_id)
 
         self._first_frame_sent = False
         self._publish_status(PIPELINE_STATUS_STOPPED, "Pipeline stopped")
@@ -104,7 +130,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         streammux.set_property("height",               self.output_height)
         streammux.set_property("gpu-id",               self.gpu_id)
         streammux.set_property("live-source",          False)
-        streammux.set_property("batched-push-timeout", 40000)
+        streammux.set_property("batched-push-timeout", 400)
         streammux.set_property("nvbuf-memory-type",    0)
         streammux.set_property("attach-sys-ts",        True)
 
@@ -142,6 +168,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         # 4. nvinferserver
         pgie = self._make("nvinferserver", "primary-inference")
         pgie.set_property("config-file-path", self.infer_config)
+        pgie.set_property("interval", 5)
 
         # 5. nvtracker for tracker id
         tracker = self._make("nvtracker", "tracker")
@@ -192,8 +219,8 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         #     when encoded frames are actually reaching the muxer/RTMP
         h264parse = self._make("h264parse", "h264-parse")
         h264parse.set_property("config-interval", -1)
-        h264_src_pad = h264parse.get_static_pad("src")
-        h264_src_pad.add_probe(
+        self._h264_src_pad = h264parse.get_static_pad("src")
+        self._first_frame_probe_id = self._h264_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
             self._first_frame_probe,
             None,
@@ -229,9 +256,9 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
                     f"Failed to link {src_el.get_name()} → {dst_el.get_name()}")
 
         # OSD probe — collect detection metadata
-        osd_pad = nvosd.get_static_pad("sink")
-        if osd_pad:
-            osd_pad.add_probe(Gst.PadProbeType.BUFFER, self._osd_probe, None)
+        self._osd_pad = nvosd.get_static_pad("sink")
+        if self._osd_pad:
+            self._osd_probe_id = self._osd_pad.add_probe(Gst.PadProbeType.BUFFER, self._osd_probe, None)
 
         return pipeline
 
@@ -242,7 +269,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         uri_src = self._make("nvurisrcbin", f"uri-src-{index}")
         uri_src.set_property("uri",                 uri)
         uri_src.set_property("gpu-id",              self.gpu_id)
-        uri_src.set_property("drop-frame-interval", 0)
+        uri_src.set_property("drop-frame-interval", 2)
         uri_src.set_property("file-loop",           True)
         nbin.add(uri_src)
 

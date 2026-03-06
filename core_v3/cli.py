@@ -18,6 +18,7 @@ from .repositories.WorkerSourcePipelineRepository import WorkerSourcePipelineRep
 from .repositories.WorkerSourceRepository import WorkerSourceRepository
 from .modules.pipeline_sync_service.pipeline_sync_service import PipelineSyncService
 from .modules.pipeline_executor.pipeline_executor import PipelineExecutor
+from .modules.triton_model_manager.triton_model_manager import TritonModelManager
 from .utils.RTMPUrl import RTMPUrl
 
 # Enable fault handler to get a traceback
@@ -164,12 +165,14 @@ def run_core_service(args):
         pipeline_repo = WorkerSourcePipelineRepository()
         source_repo = WorkerSourceRepository()
         pipeline_sync_service = PipelineSyncService(pipeline_repo)
+        triton_model_manager = TritonModelManager()
         update_queue = queue.Queue()
         pipeline_executor = PipelineExecutor(
             update_queue,
             pipeline_sync_service,
             pipeline_repo,
-            source_repo
+            source_repo,
+            triton_model_manager
         )
 
         pipeline_sync_service.subscribe_update(pipeline_executor)

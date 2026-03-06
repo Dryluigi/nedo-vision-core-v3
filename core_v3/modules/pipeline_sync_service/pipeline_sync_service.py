@@ -66,12 +66,11 @@ class PipelineSyncService:
                 self._pipelines = latest_pipelines
 
                 for change in changes:
-                    print(changes)
                     pipeline_id = change["id"]
                     change_type = change["type"]
 
                     for subscriber in self._update_subscribers:
-                        if self._is_updating or self._stop_event.is_set():
+                        if self._stop_event.is_set():
                             continue
 
                         if change_type == "updated":
