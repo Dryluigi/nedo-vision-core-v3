@@ -5,6 +5,7 @@ import signal
 import sys
 import traceback
 import logging
+from pathlib import Path
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -16,6 +17,8 @@ import faulthandler
 from .database.DatabaseManager import DatabaseManager
 from .repositories.WorkerSourcePipelineRepository import WorkerSourcePipelineRepository
 from .repositories.WorkerSourceRepository import WorkerSourceRepository
+from .modules.capture_processing_service.capture_processing_service import CaptureProcessingService
+from .modules.drawing.DrawingUtils import DrawingUtils
 from .modules.pipeline_sync_service.pipeline_sync_service import PipelineSyncService
 from .modules.pipeline_executor.pipeline_executor import PipelineExecutor
 from .modules.triton_model_manager.triton_model_manager import TritonModelManager
@@ -149,10 +152,15 @@ def run_core_service(args):
     logger = logging.getLogger(__name__)
     
     try:
+        repo_root = Path(__file__).resolve().parent.parent
+        drawing_assets_path = Path(args.drawing_assets).resolve() if args.drawing_assets else repo_root / "assets" / "drawing_assets"
+
         # Determine video sharing daemon setting
         enable_daemon = True  # Default
         if hasattr(args, 'disable_video_sharing_daemon') and args.disable_video_sharing_daemon:
             enable_daemon = False
+
+        DrawingUtils.initialize(str(drawing_assets_path))
 
         # Initialize Database with storage path
         DatabaseManager.init_databases(storage_path=args.storage_path)
@@ -166,22 +174,21 @@ def run_core_service(args):
         source_repo = WorkerSourceRepository()
         pipeline_sync_service = PipelineSyncService(pipeline_repo)
         triton_model_manager = TritonModelManager()
+        capture_processing_service = CaptureProcessingService()
         update_queue = queue.Queue()
         pipeline_executor = PipelineExecutor(
             update_queue,
             pipeline_sync_service,
             pipeline_repo,
             source_repo,
-            triton_model_manager
+            triton_model_manager,
+            capture_processing_service,
         )
 
         pipeline_sync_service.subscribe_update(pipeline_executor)
         
         logger.info("🚀 Starting Nedo Vision Core V3...")
-        if args.drawing_assets:
-            logger.info(f"🎨 Drawing Assets: {args.drawing_assets}")
-        else:
-            logger.info("🎨 Drawing Assets: Using bundled assets")
+        logger.info(f"🎨 Drawing Assets: {drawing_assets_path}")
         logger.info(f"📝 Log Level: {args.log_level}")
         logger.info(f"💾 Storage Path: {args.storage_path}")
         logger.info(f"📡 RTMP Server: {args.rtmp_server}")
@@ -204,6 +211,8 @@ def run_core_service(args):
         except KeyboardInterrupt:
             logger.info("Stopping service...")
             loop.quit()
+        finally:
+            capture_processing_service.stop_all()
     except Exception as e:
         logger.error(f"❌ Error: {e}")
         traceback.print_exc()

@@ -2,9 +2,10 @@ import threading
 import queue
 import time
 from typing import Dict
+import numpy as np
+import pyds
 
 from gi.repository import Gst
-import pyds
 
 from .constant import (
     PIPELINE_STATUS_RUNNING,
@@ -12,7 +13,12 @@ from .constant import (
     PIPELINE_STATUS_STOPPED,
     PIPELINE_STATUS_STOPPING,
 )
+
 from .deepstream_pipeline_interface import DeepstreamPipelineInterface
+from .capture_decision_engine import CaptureDecisionEngine
+from .person_attribute_aggregator import PersonAttributeAggregator
+from ..drawing.FrameDrawer import FrameDrawer
+from ..capture_processing_service.capture_processing_service import CaptureProcessingService
 from ..triton_model_manager.triton_model_manager import TritonModelManager
 
 # TODO: add icon on top of bounding box
@@ -28,6 +34,13 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         infer_config: str,
         rtmp_uri: str,
         triton_model_manager: TritonModelManager,
+        worker_id: str,
+        worker_source_id: str,
+        capture_decision_engine: CaptureDecisionEngine,
+        person_attribute_aggregator: PersonAttributeAggregator,
+        frame_drawer: FrameDrawer,
+        capture_processing_service: CaptureProcessingService,
+        class_id_to_label: Dict[int, str],
         output_width: int = 1280,
         output_height: int = 720,
         target_fps: int = 30,
@@ -39,12 +52,19 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self.file_uri       = file_uri
         self.infer_config   = infer_config
         self.rtmp_uri       = rtmp_uri
+        self.worker_id      = worker_id
+        self.worker_source_id = worker_source_id
         self.output_width   = output_width
         self.output_height  = output_height
         self.target_fps     = target_fps
         self.encode_bitrate = encode_bitrate
         self.gpu_id         = gpu_id
         self.triton_model_manager = triton_model_manager
+        self.capture_decision_engine = capture_decision_engine
+        self.person_attribute_aggregator = person_attribute_aggregator
+        self.frame_drawer = frame_drawer
+        self.capture_processing_service = capture_processing_service
+        self.class_id_to_label = class_id_to_label
 
         self._update_event_queue = update_event_queue
         self._status             = PIPELINE_STATUS_STOPPED
@@ -54,8 +74,15 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self._h264_src_pad = None
         self._first_frame_probe_id = None
         self._osd_probe_id = None
+        self._capture_appsink = None
 
         self._play_thread = None
+        self._capture_worker = self.capture_processing_service.get_or_create_worker(
+            pipeline_id=self.pipeline_id,
+            worker_id=self.worker_id,
+            worker_source_id=self.worker_source_id,
+            frame_drawer=self.frame_drawer,
+        )
 
         self._pipeline = self._build_pipeline()
 
@@ -72,9 +99,9 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self._play_thread.start()
 
     def _play_background(self):
-        self.triton_model_manager.request_model_access(self.pipeline_id, "yolo")
+        self.triton_model_manager.request_model_access(self.pipeline_id, "rfdetr")
 
-        self.triton_model_manager.wait_model_till_ready("yolo")
+        self.triton_model_manager.wait_model_till_ready("rfdetr")
 
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
@@ -95,6 +122,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self._pipeline.send_event(Gst.Event.new_eos())
         self._pipeline.set_state(Gst.State.NULL)
         self.triton_model_manager.release_model_access(self.pipeline_id)
+        self.capture_processing_service.stop_worker(self.pipeline_id)
 
         self._first_frame_sent = False
         self._publish_status(PIPELINE_STATUS_STOPPED, "Pipeline stopped")
@@ -197,6 +225,20 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         post_caps = self._make("capsfilter", "post-tiler-caps")
         post_caps.set_property("caps", Gst.Caps.from_string(
             "video/x-raw(memory:NVMM), format=RGBA"))
+        post_tee = self._make("tee", "post-tiler-tee")
+        osd_queue = self._make("queue", "osd-queue")
+        capture_queue = self._make("queue", "capture-queue")
+        capture_conv = self._make("nvvideoconvert", "capture-convert")
+        capture_conv.set_property("gpu-id", self.gpu_id)
+        capture_caps = self._make("capsfilter", "capture-caps")
+        capture_caps.set_property("caps", Gst.Caps.from_string("video/x-raw, format=RGBA"))
+        appsink = self._make("appsink", "capture-appsink")
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("max-buffers", 30)
+        appsink.set_property("drop", True)
+        appsink.connect("new-sample", self._on_new_sample)
+        self._capture_appsink = appsink
 
         # 9. OSD
         nvosd = self._make("nvdsosd", "osd")
@@ -239,21 +281,35 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         # Add & link
         for el in [mux_conv, mux_caps, pgie, tracker,
                    pre_conv, pre_caps, tiler,
-                   post_conv, post_caps, nvosd,
+                   post_conv, post_caps, post_tee, osd_queue, capture_queue, capture_conv, capture_caps, appsink, nvosd,
                    enc_conv, enc_caps, encoder, h264parse, flvmux, rtmpsink]:
             pipeline.add(el)
 
         links = [
             (streammux, mux_conv), (mux_conv, mux_caps), (mux_caps, pgie),
             (pgie, tracker), (tracker, pre_conv), (pre_conv, pre_caps),  (pre_caps, tiler),
-            (tiler, post_conv),    (post_conv, post_caps), (post_caps, nvosd),
+            (tiler, post_conv),    (post_conv, post_caps), (osd_queue, nvosd),
             (nvosd, enc_conv),     (enc_conv, enc_caps),   (enc_caps, encoder),
             (encoder, h264parse),  (h264parse, flvmux),    (flvmux, rtmpsink),
+            (capture_queue, capture_conv), (capture_conv, capture_caps), (capture_caps, appsink),
         ]
         for src_el, dst_el in links:
             if not src_el.link(dst_el):
                 raise RuntimeError(
                     f"Failed to link {src_el.get_name()} → {dst_el.get_name()}")
+
+        if not post_caps.link(post_tee):
+            raise RuntimeError("Failed to link post-tiler-caps to tee")
+
+        osd_pad = post_tee.get_request_pad("src_%u")
+        osd_queue_pad = osd_queue.get_static_pad("sink")
+        if not osd_pad or not osd_queue_pad or osd_pad.link(osd_queue_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link tee to OSD branch")
+
+        capture_pad = post_tee.get_request_pad("src_%u")
+        capture_queue_pad = capture_queue.get_static_pad("sink")
+        if not capture_pad or not capture_queue_pad or capture_pad.link(capture_queue_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link tee to capture branch")
 
         # OSD probe — collect detection metadata
         self._osd_pad = nvosd.get_static_pad("sink")
@@ -332,6 +388,50 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
 
             l_obj = frame_meta.obj_meta_list
 
+            # Collect detections
+            detections = []
+
+            while l_obj:
+                try:
+                    obj = pyds.NvDsObjectMeta.cast(l_obj.data)
+                except StopIteration:
+                    break
+
+                bbox = [
+                    int(obj.rect_params.left),
+                    int(obj.rect_params.top),
+                    int(obj.rect_params.left + obj.rect_params.width),
+                    int(obj.rect_params.top + obj.rect_params.height),
+                ]
+
+                detections.append({
+                    "bbox": bbox,
+                    "class_id": obj.class_id,
+                    "confidence": obj.confidence,
+                    "track_id": obj.object_id,
+                })
+
+                try:
+                    l_obj = l_obj.next
+                except StopIteration:
+                    break
+
+            
+            persons = self.person_attribute_aggregator.aggregate(detections)
+            for person in persons:
+                person_id = str(person["person_id"])
+                attrs = [a["class_id"] for a in person["attributes"]]
+
+                self.capture_decision_engine.register(person_id, attrs)
+                triggered_labels = self.capture_decision_engine.get_triggered_labels(person_id)
+                if triggered_labels:
+                    tracked_object = self._build_tracked_object(person_id, person)
+                    self._capture_worker.enqueue_capture(buf.pts, tracked_object)
+
+            # Drawing logic
+
+            l_obj = frame_meta.obj_meta_list
+
             while l_obj:
                 try:
                     obj = pyds.NvDsObjectMeta.cast(l_obj.data)
@@ -339,7 +439,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
                     break
 
                 # 🎯 Apply only for PERSON
-                if obj.class_id == 0:
+                if obj.class_id == 4:
 
                     # Remove default label safely
                     obj.text_params.display_text = ""
@@ -500,7 +600,55 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
 
         return Gst.PadProbeReturn.OK
 
-    # ── Bus ──────────────────────────────────────────────────────────────────
+    def _on_new_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+        width = structure.get_value("width")
+        height = structure.get_value("height")
+
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
+
+        try:
+            frame = memoryview(map_info.data)
+            frame_rgba = bytearray(frame)
+            np_frame = np.ndarray((height, width, 4), buffer=frame_rgba, dtype="uint8").copy()
+            self._capture_worker.store_frame(buffer.pts, np_frame)
+        finally:
+            buffer.unmap(map_info)
+
+        return Gst.FlowReturn.OK
+
+    def _build_tracked_object(self, person_id: str, person: dict) -> dict:
+        counts = self.capture_decision_engine.get_attribute_counts(person_id)
+        attributes_by_label = {}
+
+        for attr in person["attributes"]:
+            label = self.class_id_to_label.get(attr["class_id"], str(attr["class_id"]))
+            existing = attributes_by_label.get(label)
+            candidate = {
+                "label": label,
+                "confidence": attr.get("confidence", 0.0),
+                "bbox": attr.get("bbox"),
+                "count": counts.get(attr["class_id"], 0),
+            }
+            if existing is None or candidate["confidence"] > existing["confidence"]:
+                attributes_by_label[label] = candidate
+
+        return {
+            "person_id": person_id,
+            "track_id": person.get("person_id"),
+            "detections": self.capture_decision_engine.get_detection_count(person_id),
+            "bbox": person["bbox"],
+            "confidence": person.get("confidence", 0.0),
+            "attributes": list(attributes_by_label.values()),
+        }
 
     def _bus_call(self, bus, message):
         t = message.type
@@ -527,3 +675,45 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
                 "message":       message,
                 "timestamp":     time.time(),
             })
+
+    def crop_with_padding(self, frame, bbox, padding_ratio=0.25):
+        """
+        bbox format: [x1, y1, x2, y2]
+        padding_ratio: percentage of bbox size
+        """
+
+        h, w = frame.shape[:2]
+
+        x1, y1, x2, y2 = bbox
+
+        bw = x2 - x1
+        bh = y2 - y1
+
+        pad_w = int(bw * padding_ratio)
+        pad_h = int(bh * padding_ratio)
+
+        x1 = max(0, x1 - pad_w)
+        y1 = max(0, y1 - pad_h)
+        x2 = min(w, x2 + pad_w)
+        y2 = min(h, y2 + pad_h)
+
+        return frame[y1:y2, x1:x2]
+    
+    def safe_bbox(self, bbox, frame_w, frame_h):
+        """
+        Clamp bbox to frame boundaries.
+        bbox format: [x1, y1, x2, y2]
+        """
+
+        x1, y1, x2, y2 = bbox
+
+        x1 = max(0, min(x1, frame_w - 1))
+        y1 = max(0, min(y1, frame_h - 1))
+        x2 = max(0, min(x2, frame_w - 1))
+        y2 = max(0, min(y2, frame_h - 1))
+
+        # ensure bbox is valid
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        return [x1, y1, x2, y2]

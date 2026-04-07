@@ -8,6 +8,10 @@ from ..deepstream_pipeline.file_deepstream_pipeline import FileDeepstreamPipelin
 from ..deepstream_pipeline.live_deepstream_pipeline import LiveRtspDeepstreamPipeline
 from ..deepstream_pipeline.constant import PIPELINE_STATUS_RUNNING, PIPELINE_STATUS_STARTING, PIPELINE_STATUS_STOPPED, PIPELINE_STATUS_STOPPING
 from ..triton_model_manager.triton_model_manager import TritonModelManager
+from ..deepstream_pipeline.person_attribute_aggregator import PersonAttributeAggregator
+from ..deepstream_pipeline.capture_decision_engine import CaptureDecisionEngine
+from ..capture_processing_service.capture_processing_service import CaptureProcessingService
+from ..drawing.FrameDrawer import FrameDrawer
 from ...repositories.WorkerSourcePipelineRepository import WorkerSourcePipelineRepository
 from ...repositories.WorkerSourceRepository import WorkerSourceRepository
 from ...utils.RTMPUrl import RTMPUrl
@@ -20,6 +24,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             pipeline_repository: WorkerSourcePipelineRepository,
             source_repository: WorkerSourceRepository,
             triton_model_manager: TritonModelManager,
+            capture_processing_service: CaptureProcessingService,
         ):
         self._pipelines = {}
         self._deepstream_pipelines_update_queue = deepstream_pipelines_update_queue
@@ -27,6 +32,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         self._pipeline_repository = pipeline_repository
         self._source_repository = source_repository
         self._triton_model_manager = triton_model_manager
+        self._capture_processing_service = capture_processing_service
         self._update_status_listener_thread = None
 
         self._start_status_update_listener()
@@ -59,14 +65,54 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             if not file_url.startswith("file://"):
                 file_url = "file://" + file_url
 
+            person_attribute_aggregator = PersonAttributeAggregator(
+                person_class_id=4,
+                attribute_class_ids=[1, 2, 3, 5],
+                coverage_threshold=0.3,
+                person_conf_threshold=0.5,
+                attribute_conf_threshold=0.5,
+            )
+            capture_decision_engine = CaptureDecisionEngine(
+                capture_threshold=5,
+                track_timeout_seconds=5
+            )
+            frame_drawer = FrameDrawer()
+            frame_drawer.location_name = pipeline.location_name or source.name or "LOCATION"
+            frame_drawer.update_config(
+                icons={
+                    "helmet": "assets/icons/helmet-green.png",
+                    "no_helmet": "assets/icons/helmet-red.png",
+                    "vest": "assets/icons/vest-green.png",
+                    "no_vest": "assets/icons/vest-red.png",
+                },
+                violation_labels=["no_helmet", "no_vest"],
+                compliance_labels=["helmet", "vest"],
+            )
+            class_id_to_label = {
+                0: "background",
+                1: "helmet",
+                2: "no_helmet",
+                3: "no_vest",
+                4: "person",
+                5: "vest",
+            }
+
             pipeline = FileDeepstreamPipeline(
                 pipeline.id,
                 f"{pipeline.name}",
                 self._deepstream_pipelines_update_queue,
                 file_url,
-                "/app/config/deepstream-inferserver-yolo.txt",
+                # "/app/config/deepstream-inferserver-yolo.txt",
+                "/app/config/deepstream-inferserver-rfdetr.txt",
                 RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}"),
-                self._triton_model_manager
+                self._triton_model_manager,
+                pipeline.worker_id,
+                source.id,
+                capture_decision_engine,
+                person_attribute_aggregator,
+                frame_drawer,
+                self._capture_processing_service,
+                class_id_to_label,
             )
 
             self._pipelines[pipeline_id] = pipeline
