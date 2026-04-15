@@ -2,15 +2,19 @@ import threading
 import time
 import queue
 from typing import Dict
+import numpy as np
 
 import pyds
 from gi.repository import Gst
 
+from .capture_decision_engine import CaptureDecisionEngine
 from .constant import PIPELINE_STATUS_RUNNING, PIPELINE_STATUS_STARTING, PIPELINE_STATUS_STOPPED, PIPELINE_STATUS_STOPPING
 from .deepstream_pipeline_interface import DeepstreamPipelineInterface
+from .person_attribute_aggregator import PersonAttributeAggregator
+from .ppe_preview_renderer import PPEPreviewRenderer
+from ..capture_processing_service.capture_processing_service import CaptureProcessingService
+from ..drawing.FrameDrawer import FrameDrawer
 from ..triton_model_manager.triton_model_manager import TritonModelManager
-
-import time
 
 class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
@@ -20,7 +24,16 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         pipeline_name: str,
         update_event_queue: queue.Queue,
         rtsp_url: str,
+        infer_config: str,
         triton_model_manager: TritonModelManager,
+        worker_id: str | None = None,
+        worker_source_id: str | None = None,
+        location_name: str | None = None,
+        capture_decision_engine: CaptureDecisionEngine | None = None,
+        person_attribute_aggregator: PersonAttributeAggregator | None = None,
+        frame_drawer: FrameDrawer | None = None,
+        capture_processing_service: CaptureProcessingService | None = None,
+        class_id_to_label: Dict[int, str] | None = None,
         rtmp_location: str = "rtmp://host.containers.internal:1935/live/cctv-5",
         output_width: int = 1280,
         output_height: int = 720,
@@ -36,9 +49,43 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self._pipeline_id = pipeline_id
         self._pipeline_name = pipeline_name
         self._rtsp_url = rtsp_url
+        self._infer_config = infer_config
         self._rtmp_location = rtmp_location
         self._output_width = output_width
         self._output_height = output_height
+        self._worker_id = worker_id
+        self._worker_source_id = worker_source_id
+        self._location_name = location_name or pipeline_name
+        self._capture_decision_engine = capture_decision_engine
+        self._person_attribute_aggregator = person_attribute_aggregator
+        self._capture_processing_service = capture_processing_service
+        self._class_id_to_label = class_id_to_label or {
+            0: "background",
+            1: "helmet",
+            2: "no_helmet",
+            3: "no_vest",
+            4: "person",
+            5: "vest",
+        }
+        self._frame_drawer = frame_drawer or FrameDrawer()
+        self._frame_drawer.location_name = self._location_name
+        self._preview_renderer = PPEPreviewRenderer(
+            frame_drawer=self._frame_drawer,
+            class_id_to_label=self._class_id_to_label,
+            location_name=self._location_name,
+            person_class_id=4,
+            attribute_class_ids={1, 2, 3, 5},
+            preview_style_hold_seconds=3.0,
+        )
+        self._capture_appsink = None
+        self._capture_worker = None
+        if self._capture_processing_service is not None:
+            self._capture_worker = self._capture_processing_service.get_or_create_worker(
+                pipeline_id=self._pipeline_id,
+                worker_id=self._worker_id or self._pipeline_id,
+                worker_source_id=self._worker_source_id or "",
+                frame_drawer=self._frame_drawer,
+            )
 
         self._pipeline = Gst.Pipeline.new("deepstream-pipeline")
         self._bus = None
@@ -67,10 +114,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             "nvinferserver",
             "primary-inference"
         )
-        self.pgie.set_property(
-            "config-file-path",
-            "/app/config/deepstream-inferserver-yolo.txt"
-        )
+        self.pgie.set_property("config-file-path", self._infer_config)
         self.pgie.set_property("interval", 5)
 
         self.tracker = Gst.ElementFactory.make("nvtracker", "tracker")
@@ -83,6 +127,19 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self.conv_caps.set_property("caps", Gst.Caps.from_string(
             "video/x-raw(memory:NVMM), format=RGBA"
         ))
+        self.post_tee = Gst.ElementFactory.make("tee", "post-tiler-tee")
+        self.osd_queue = Gst.ElementFactory.make("queue", "osd-queue")
+        self.capture_queue = Gst.ElementFactory.make("queue", "capture-queue")
+        self.capture_conv = Gst.ElementFactory.make("nvvideoconvert", "capture-convert")
+        self.capture_caps = Gst.ElementFactory.make("capsfilter", "capture-caps")
+        self.capture_caps.set_property("caps", Gst.Caps.from_string("video/x-raw, format=RGBA"))
+        self.capture_appsink = Gst.ElementFactory.make("appsink", "capture-appsink")
+        self.capture_appsink.set_property("emit-signals", True)
+        self.capture_appsink.set_property("sync", False)
+        self.capture_appsink.set_property("max-buffers", 30)
+        self.capture_appsink.set_property("drop", True)
+        self.capture_appsink.connect("new-sample", self._on_new_sample)
+        self._capture_appsink = self.capture_appsink
 
         self.osd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
         self.osd.set_property("process-mode", 0)
@@ -121,6 +178,12 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             self.tracker,
             self.conv,
             self.conv_caps,
+            self.post_tee,
+            self.osd_queue,
+            self.capture_queue,
+            self.capture_conv,
+            self.capture_caps,
+            self.capture_appsink,
             self.osd,
             self.enc_conv,
             self.enc_caps,
@@ -138,8 +201,20 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self.pgie_queue.link(self.pgie)
         self.pgie.link(self.tracker)
         self.tracker.link(self.conv)
-        self.conv.link(self.conv_caps)      # ← add
-        self.conv_caps.link(self.osd)       # ← change from conv.link(self.osd)
+        self.conv.link(self.conv_caps)
+        self.conv_caps.link(self.post_tee)
+        tee_osd_pad = self.post_tee.get_request_pad("src_%u")
+        osd_queue_pad = self.osd_queue.get_static_pad("sink")
+        if not tee_osd_pad or not osd_queue_pad or tee_osd_pad.link(osd_queue_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link live tee to OSD branch")
+        tee_capture_pad = self.post_tee.get_request_pad("src_%u")
+        capture_queue_pad = self.capture_queue.get_static_pad("sink")
+        if not tee_capture_pad or not capture_queue_pad or tee_capture_pad.link(capture_queue_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link live tee to capture branch")
+        self.osd_queue.link(self.osd)
+        self.capture_queue.link(self.capture_conv)
+        self.capture_conv.link(self.capture_caps)
+        self.capture_caps.link(self.capture_appsink)
         self.osd.link(self.enc_conv)
         self.enc_conv.link(self.enc_caps)
         self.enc_caps.link(self.encoder)
@@ -241,9 +316,9 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self._play_thread.start()
 
     def _play_background(self):
-        self._triton_model_manager.request_model_access(self._pipeline_id, "yolo")
+        self._triton_model_manager.request_model_access(self._pipeline_id, "rfdetr")
 
-        self._triton_model_manager.wait_model_till_ready("yolo")
+        self._triton_model_manager.wait_model_till_ready("rfdetr")
 
         self._source_bin.sync_state_with_parent()
         self._pipeline.set_state(Gst.State.PLAYING)
@@ -267,6 +342,8 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         )
 
         self._pipeline.set_state(Gst.State.NULL)
+        if self._capture_processing_service is not None:
+            self._capture_processing_service.stop_worker(self._pipeline_id)
 
         # Release streammux pad
         if self.streammux:
@@ -290,6 +367,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         return {
             "pipeline_id": self._pipeline_id,
             "pipeline_name": self._pipeline_name,
+            "location_name": self._location_name,
             "pipeline_status": self._status,
             "source_type_code": "live",
             "source_file_path": "",
@@ -363,6 +441,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
                 break
 
             l_obj = frame_meta.obj_meta_list
+            detections = []
 
             while l_obj:
                 try:
@@ -370,155 +449,58 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
                 except StopIteration:
                     break
 
-                # 🎯 Apply only for PERSON
-                if obj.class_id == 0:
+                bbox = [
+                    int(obj.rect_params.left),
+                    int(obj.rect_params.top),
+                    int(obj.rect_params.left + obj.rect_params.width),
+                    int(obj.rect_params.top + obj.rect_params.height),
+                ]
 
-                    # Remove default label safely
-                    obj.text_params.display_text = ""
-                    obj.text_params.set_bg_clr = 0
-                    obj.text_params.font_params.font_size = 0
+                detections.append({
+                    "bbox": bbox,
+                    "class_id": obj.class_id,
+                    "confidence": obj.confidence,
+                    "track_id": obj.object_id,
+                })
 
-                    r = obj.rect_params
-                    x = int(r.left)
-                    y = int(r.top)
-                    w = int(r.width)
-                    h = int(r.height)
+                try:
+                    l_obj = l_obj.next
+                except StopIteration:
+                    break
 
-                    # ───────── Base Thin Neutral Rectangle ─────────
-                    r.border_width = 2
-                    r.border_color.set(0.7, 0.7, 0.7, 1)
+            persons = []
+            if self._person_attribute_aggregator is not None:
+                persons = self._person_attribute_aggregator.aggregate(detections)
+                for person in persons:
+                    if self._capture_decision_engine is None or self._capture_worker is None:
+                        continue
 
-                    # ───────── Corner Overlay ─────────
-                    corner_len = min(int(w * 0.15), 25)
-                    thickness = 4
+                    person_id = str(person["person_id"])
+                    attrs = [a["class_id"] for a in person["attributes"]]
+                    self._capture_decision_engine.register(person_id, attrs)
+                    triggered_labels = self._capture_decision_engine.get_triggered_labels(person_id)
+                    if triggered_labels:
+                        tracked_object = self._build_tracked_object(person_id, person)
+                        self._capture_worker.enqueue_capture(buf.pts, tracked_object)
 
-                    display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                    display_meta.num_lines = 8
-                    display_meta.num_labels = 2
+            person_style_by_track_id = self._preview_renderer.build_person_style_map(persons)
+            l_obj = frame_meta.obj_meta_list
 
-                    lines = display_meta.line_params
+            while l_obj:
+                try:
+                    obj = pyds.NvDsObjectMeta.cast(l_obj.data)
+                except StopIteration:
+                    break
 
-                    for i in range(8):
-                        lines[i].line_width = thickness
-                        lines[i].line_color.set(0.0, 0.7, 1.0, 1.0)
-
-                    # Top-left
-                    lines[0].x1, lines[0].y1 = x, y
-                    lines[0].x2, lines[0].y2 = x + corner_len, y
-                    lines[1].x1, lines[1].y1 = x, y
-                    lines[1].x2, lines[1].y2 = x, y + corner_len
-
-                    # Top-right
-                    lines[2].x1, lines[2].y1 = x + w, y
-                    lines[2].x2, lines[2].y2 = x + w - corner_len, y
-                    lines[3].x1, lines[3].y1 = x + w, y
-                    lines[3].x2, lines[3].y2 = x + w, y + corner_len
-
-                    # Bottom-left
-                    lines[4].x1, lines[4].y1 = x, y + h
-                    lines[4].x2, lines[4].y2 = x + corner_len, y + h
-                    lines[5].x1, lines[5].y1 = x, y + h
-                    lines[5].x2, lines[5].y2 = x, y + h - corner_len
-
-                    # Bottom-right
-                    lines[6].x1, lines[6].y1 = x + w, y + h
-                    lines[6].x2, lines[6].y2 = x + w - corner_len, y + h
-                    lines[7].x1, lines[7].y1 = x + w, y + h
-                    lines[7].x2, lines[7].y2 = x + w, y + h - corner_len
-
-                    # ───────── GRADIENT BACKGROUND ─────────
-                    gradient_height = 50
-                    steps = 32  # smoother gradient
-
-                    slice_height = max(1, gradient_height // steps)
-
-                    base_r = 0.0
-                    base_g = 0.7
-                    base_b = 1.0
-
-                    MAX_RECTS = 16  # DeepStream limit
-
-                    remaining = steps
-                    current_step = 0
-
-                    while remaining > 0:
-                        batch_count = min(remaining, MAX_RECTS)
-
-                        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                        display_meta.num_rects = batch_count
-
-                        for i in range(batch_count):
-                            rect = display_meta.rect_params[i]
-
-                            global_index = current_step + i
-
-                            rect.left = x
-                            rect.top = y + h - ((global_index + 1) * slice_height)
-                            rect.width = w
-                            rect.height = slice_height + 1
-
-                            rect.border_width = 0
-                            rect.has_bg_color = 1
-
-                            progress = global_index / steps
-                            alpha = 0.2 * (1 - progress**2)
-
-                            rect.bg_color.set(base_r, base_g, base_b, alpha)
-
-                        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
-
-                        remaining -= batch_count
-                        current_step += batch_count
-
-                    # ───────── TEXT OVERLAY (FINAL CLEAN VERSION) ─────────
-                    tracker_id = obj.object_id
-                    location_text = getattr(self, "_location_name", "Unknown")
-                    confidence_text = f"{obj.confidence:.2f}"
-
-                    display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                    display_meta.num_labels = 3
-                    texts = display_meta.text_params
-
-                    # Base bottom-left anchor
-                    base_x = x + 8
-                    base_y = y + h - 16
-
-                    line_spacing = 12
-
-                    # ─────── 1️⃣ TRACKER ID (ABOVE LOCATION NAME IN FOOTER) ───────
-                    left_shift = 1      # move left by X pixels
-                    up_shift = 4        # move up by Y pixels
-
-                    texts[0].display_text = f"{tracker_id}"
-                    texts[0].x_offset = safe_offset(base_x - left_shift, frame_w - 1)
-                    texts[0].y_offset = safe_offset(base_y - line_spacing - up_shift, frame_h - 1)
-                    texts[0].font_params.font_name = "Serif"
-                    texts[0].font_params.font_size = 8
-                    texts[0].font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-                    texts[0].set_bg_clr = 0
-
-                    # ─────── 2️⃣ LOCATION NAME ───────
-                    texts[1].display_text = location_text
-                    texts[1].x_offset = safe_offset(base_x, frame_w - 1)
-                    texts[1].y_offset = safe_offset(base_y, frame_h - 1)
-                    texts[1].font_params.font_name = "Serif"
-                    texts[1].font_params.font_size = 6
-                    texts[1].font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-                    texts[1].set_bg_clr = 0
-
-                    # ─────── 3️⃣ CONFIDENCE (BOTTOM RIGHT) ───────
-                    char_width_estimate = 10
-                    approx_text_width = len(confidence_text) * char_width_estimate
-
-                    texts[2].display_text = confidence_text
-                    texts[2].x_offset = safe_offset(x + w - approx_text_width + 8, frame_w - 1)
-                    texts[2].y_offset = safe_offset(base_y, frame_h - 1)
-                    texts[2].font_params.font_name = "Serif"
-                    texts[2].font_params.font_size = 6
-                    texts[2].font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-                    texts[2].set_bg_clr = 0
-
-                    pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+                self._preview_renderer.apply_object_preview(
+                    batch_meta=batch_meta,
+                    frame_meta=frame_meta,
+                    obj=obj,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    safe_offset=safe_offset,
+                    person_style_by_track_id=person_style_by_track_id,
+                )
 
                 try:
                     l_obj = l_obj.next
@@ -531,6 +513,61 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
                 break
 
         return Gst.PadProbeReturn.OK
+
+    def _on_new_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+        width = structure.get_value("width")
+        height = structure.get_value("height")
+
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
+
+        try:
+            frame = memoryview(map_info.data)
+            frame_rgba = bytearray(frame)
+            np_frame = np.ndarray((height, width, 4), buffer=frame_rgba, dtype="uint8").copy()
+            if self._capture_worker is not None:
+                self._capture_worker.store_frame(buffer.pts, np_frame)
+        finally:
+            buffer.unmap(map_info)
+
+        return Gst.FlowReturn.OK
+
+    def _build_tracked_object(self, person_id: str, person: dict) -> dict:
+        counts = {}
+        detections = 0
+        if self._capture_decision_engine is not None:
+            counts = self._capture_decision_engine.get_attribute_counts(person_id)
+            detections = self._capture_decision_engine.get_detection_count(person_id)
+
+        attributes_by_label = {}
+        for attr in person["attributes"]:
+            label = self._class_id_to_label.get(attr["class_id"], str(attr["class_id"]))
+            existing = attributes_by_label.get(label)
+            candidate = {
+                "label": label,
+                "confidence": attr.get("confidence", 0.0),
+                "bbox": attr.get("bbox"),
+                "count": counts.get(attr["class_id"], 0),
+            }
+            if existing is None or candidate["confidence"] > existing["confidence"]:
+                attributes_by_label[label] = candidate
+
+        return {
+            "person_id": person_id,
+            "track_id": person.get("person_id"),
+            "detections": detections,
+            "bbox": person["bbox"],
+            "confidence": person.get("confidence", 0.0),
+            "attributes": list(attributes_by_label.values()),
+        }
     
     def _first_frame_probe(self, pad, info, u_data):
         if not self._first_frame_sent:

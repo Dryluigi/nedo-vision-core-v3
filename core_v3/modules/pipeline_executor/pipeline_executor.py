@@ -49,13 +49,55 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             return
 
         # Create deepstream pipeline
+        frame_drawer = FrameDrawer()
+        location_name = pipeline.location_name or source.name or "LOCATION"
+        frame_drawer.location_name = location_name
+        frame_drawer.update_config(
+            icons={
+                "helmet": "assets/icons/helmet-green.png",
+                "no_helmet": "assets/icons/helmet-red.png",
+                "vest": "assets/icons/vest-green.png",
+                "no_vest": "assets/icons/vest-red.png",
+            },
+            violation_labels=["no_helmet", "no_vest"],
+            compliance_labels=["helmet", "vest"],
+        )
+        class_id_to_label = {
+            0: "background",
+            1: "helmet",
+            2: "no_helmet",
+            3: "no_vest",
+            4: "person",
+            5: "vest",
+        }
+        capture_decision_engine = CaptureDecisionEngine(
+            capture_threshold=5,
+            track_timeout_seconds=5
+        )
+        person_attribute_aggregator = PersonAttributeAggregator(
+            person_class_id=4,
+            attribute_class_ids=[1, 2, 3, 5],
+            coverage_threshold=0.3,
+            person_conf_threshold=0.5,
+            attribute_conf_threshold=0.5,
+        )
+
         if source.type_code == "live":
             pipeline = LiveRtspDeepstreamPipeline(
                 pipeline.id,
                 f"{pipeline.name}",
                 self._deepstream_pipelines_update_queue,
                 source.url,
+                "/app/config/deepstream-inferserver-rfdetr.txt",
                 self._triton_model_manager,
+                pipeline.worker_id,
+                source.id,
+                location_name,
+                capture_decision_engine,
+                person_attribute_aggregator,
+                frame_drawer,
+                self._capture_processing_service,
+                class_id_to_label,
                 RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}")
             )
 
@@ -64,38 +106,6 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             file_url = source.file_path
             if not file_url.startswith("file://"):
                 file_url = "file://" + file_url
-
-            person_attribute_aggregator = PersonAttributeAggregator(
-                person_class_id=4,
-                attribute_class_ids=[1, 2, 3, 5],
-                coverage_threshold=0.3,
-                person_conf_threshold=0.5,
-                attribute_conf_threshold=0.5,
-            )
-            capture_decision_engine = CaptureDecisionEngine(
-                capture_threshold=5,
-                track_timeout_seconds=5
-            )
-            frame_drawer = FrameDrawer()
-            frame_drawer.location_name = pipeline.location_name or source.name or "LOCATION"
-            frame_drawer.update_config(
-                icons={
-                    "helmet": "assets/icons/helmet-green.png",
-                    "no_helmet": "assets/icons/helmet-red.png",
-                    "vest": "assets/icons/vest-green.png",
-                    "no_vest": "assets/icons/vest-red.png",
-                },
-                violation_labels=["no_helmet", "no_vest"],
-                compliance_labels=["helmet", "vest"],
-            )
-            class_id_to_label = {
-                0: "background",
-                1: "helmet",
-                2: "no_helmet",
-                3: "no_vest",
-                4: "person",
-                5: "vest",
-            }
 
             pipeline = FileDeepstreamPipeline(
                 pipeline.id,
@@ -108,6 +118,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 self._triton_model_manager,
                 pipeline.worker_id,
                 source.id,
+                location_name,
                 capture_decision_engine,
                 person_attribute_aggregator,
                 frame_drawer,
@@ -143,7 +154,11 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         active_pipeline_status = pipeline_metadata["pipeline_status"]
 
         # If pipeline already running here and metadata is changed, then restart it.
-        if pipeline_metadata["pipeline_id"] != pipeline.id or pipeline_metadata["pipeline_name"] != pipeline.name:
+        if (
+            pipeline_metadata["pipeline_id"] != pipeline.id
+            or pipeline_metadata["pipeline_name"] != pipeline.name
+            or pipeline_metadata.get("location_name") != pipeline.location_name
+        ):
             print("Ada perubahan metadata coy")
             if active_pipeline_status in [PIPELINE_STATUS_STARTING, PIPELINE_STATUS_RUNNING]:
                 print("Restarting")
