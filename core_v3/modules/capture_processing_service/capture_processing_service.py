@@ -1,6 +1,6 @@
 import threading
 
-from ..deepstream_pipeline.async_capture_worker import AsyncCaptureWorker
+from .async_capture_worker import AsyncCaptureWorker
 
 
 class CaptureProcessingService:
