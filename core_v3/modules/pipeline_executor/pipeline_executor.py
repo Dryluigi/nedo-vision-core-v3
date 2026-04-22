@@ -1,5 +1,6 @@
 import queue
 import threading
+import re
 from .pipeline_executor_interface import PipelineExecutorInterface
 from ..pipeline_sync_notifier.pipeline_sync_notifier_interface import PipelineSyncNotifierInterface
 from ..pipeline_sync_service.pipeline_sync_service import PipelineSyncService
@@ -17,6 +18,9 @@ from ...repositories.WorkerSourceRepository import WorkerSourceRepository
 from ...utils.RTMPUrl import RTMPUrl
 
 class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface, SourceSyncNotifierInterface):
+    DEFAULT_OUTPUT_WIDTH = 1280
+    DEFAULT_OUTPUT_HEIGHT = 720
+
     def __init__(
             self,
             deepstream_pipelines_update_queue: queue.Queue,
@@ -47,6 +51,10 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         source = self._source_repository.get_worker_source(pipeline.worker_source_id)
         if not pipeline:
             return
+
+        output_width, output_height = self._parse_resolution(
+            source.resolution
+        )
 
         # Create deepstream pipeline
         frame_drawer = FrameDrawer()
@@ -98,7 +106,9 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 frame_drawer,
                 self._capture_processing_service,
                 class_id_to_label,
-                RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}")
+                RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}"),
+                output_width=output_width,
+                output_height=output_height,
             )
 
             self._pipelines[pipeline_id] = pipeline
@@ -124,6 +134,8 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 frame_drawer,
                 self._capture_processing_service,
                 class_id_to_label,
+                output_width=output_width,
+                output_height=output_height,
             )
 
             self._pipelines[pipeline_id] = pipeline
@@ -209,6 +221,23 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
     def _start_status_update_listener(self):
         self._update_status_listener_thread = threading.Thread(target=self._listen_pipeline_status_update_queue)
         self._update_status_listener_thread.start()
+
+    @classmethod
+    def _parse_resolution(cls, resolution: str | None) -> tuple[int, int]:
+        if not resolution:
+            return cls.DEFAULT_OUTPUT_WIDTH, cls.DEFAULT_OUTPUT_HEIGHT
+
+        cleaned = resolution.strip().lower()
+        match = re.search(r"(\d+)\s*[x:*,/ -]\s*(\d+)", cleaned)
+        if not match:
+            return cls.DEFAULT_OUTPUT_WIDTH, cls.DEFAULT_OUTPUT_HEIGHT
+
+        width = int(match.group(1))
+        height = int(match.group(2))
+        if width <= 0 or height <= 0:
+            return cls.DEFAULT_OUTPUT_WIDTH, cls.DEFAULT_OUTPUT_HEIGHT
+
+        return width, height
 
     def  _listen_pipeline_status_update_queue(self):
         while True:
