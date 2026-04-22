@@ -12,8 +12,28 @@ from ...database.DatabaseManager import DatabaseManager
 from ...repositories.PPEDetectionRepository import PPEDetectionRepository
 from ..drawing.DrawingUtils import DrawingUtils
 
+"""Async capture worker responsibilities.
+
+This worker decouples heavy capture processing from the DeepStream thread by:
+1) buffering recent RGBA frames keyed by PTS,
+2) accepting capture events through an internal queue,
+3) annotating/saving full + cropped images, and
+4) persisting detection metadata to the repository.
+"""
+
 
 class AsyncCaptureWorker:
+    """Background worker for capture event processing.
+
+    Producer side:
+    - `store_frame(...)` is called frequently from appsink callbacks.
+    - `enqueue_capture(...)` is called when capture rules are triggered.
+
+    Consumer side:
+    - A dedicated daemon thread (`_run`) reads `_capture_queue` and runs
+      `_process_capture(...)` for each event.
+    """
+
     def __init__(
         self,
         pipeline_id: str,
@@ -42,6 +62,7 @@ class AsyncCaptureWorker:
         self._worker_thread.start()
 
     def stop(self):
+        """Stop worker thread gracefully by sending a sentinel queue item."""
         self._running = False
         try:
             self._capture_queue.put_nowait(None)
@@ -50,6 +71,7 @@ class AsyncCaptureWorker:
         self._worker_thread.join(timeout=2.0)
 
     def store_frame(self, pts: int, frame_rgba):
+        """Cache latest frames by PTS for later capture event lookup."""
         if frame_rgba is None:
             return
 
@@ -60,6 +82,7 @@ class AsyncCaptureWorker:
                 self._cached_frames.popitem(last=False)
 
     def enqueue_capture(self, pts: int, tracked_object: dict):
+        """Enqueue capture work item; drop when queue is saturated."""
         payload = {
             "pts": pts,
             "tracked_object": copy.deepcopy(tracked_object),
@@ -71,6 +94,7 @@ class AsyncCaptureWorker:
             logging.warning("Capture queue full for pipeline %s, dropping capture event", self.pipeline_id)
 
     def _run(self):
+        """Consume queue items and process captures on the worker thread."""
         while self._running:
             item = self._capture_queue.get()
             if item is None:
@@ -82,6 +106,7 @@ class AsyncCaptureWorker:
                 logging.exception("Failed to process capture event for pipeline %s", self.pipeline_id)
 
     def _process_capture(self, payload: dict):
+        """Render/save capture artifacts and persist detection metadata."""
         frame_rgba = self._get_frame(payload["pts"])
         if frame_rgba is None:
             logging.warning("No cached frame found for capture event on pipeline %s", self.pipeline_id)
@@ -120,6 +145,7 @@ class AsyncCaptureWorker:
         )
 
     def _get_frame(self, pts: int):
+        """Get matching frame by PTS, fallback to the most recent cached frame."""
         with self._frame_lock:
             frame = self._cached_frames.get(pts)
             if frame is not None:
