@@ -2,6 +2,9 @@ import threading
 from typing import Dict, Set, Optional
 
 from .triton_model_owner import TritonModelOwner
+from ...repositories.AIModelRepository import AIModelRepository
+from ..triton_model_converter.model_preparation_error import ModelPreparationError
+from ..triton_model_converter.rfdetr_triton_model_converter import RfdetrTritonModelConverter
 
 
 # ── Config Registry ───────────────────────────────────────────────────────────
@@ -27,6 +30,14 @@ class TritonModelManager:
         self._gpu_id               = gpu_id
         self._idle_timeout         = idle_timeout_seconds
         self._lock                 = threading.Lock()
+        self._prepare_locks_guard  = threading.Lock()
+        self._prepare_locks: Dict[str, threading.Lock] = {}
+        self._ai_model_repository  = AIModelRepository()
+        self._model_processors     = {
+            "rf_detr": RfdetrTritonModelConverter(),
+        }
+        self._resolved_infer_configs: Dict[str, str] = {}
+        self._active_ai_model_by_model_id: Dict[str, str] = {}
 
         # model_id → TritonModelOwner
         self._owners: Dict[str, TritonModelOwner] = {}
@@ -40,18 +51,45 @@ class TritonModelManager:
         # model_id → idle timer thread
         self._idle_timers: Dict[str, threading.Timer] = {}
 
-    def request_model_access(self, client_id: str, model_id: str):
+    def request_model_access(self, client_id: str, model_id: str, ai_model_id: Optional[str] = None):
         """
         Register a client as using a model.
         Lazily starts the TritonModelOwner if not already running.
         Cancels any pending idle shutdown timer for that model.
         """
+        if ai_model_id:
+            prep_lock = self._get_preparation_lock(ai_model_id)
+            with prep_lock:
+                infer_config_path, resolved_ai_model_id = self._ensure_model_ready(
+                    model_id=model_id,
+                    ai_model_id=ai_model_id,
+                )
+        else:
+            infer_config_path, resolved_ai_model_id = self._ensure_model_ready(
+                model_id=model_id,
+                ai_model_id=ai_model_id,
+            )
+
         with self._lock:
             # Cancel idle timer if model was counting down
             self._cancel_idle_timer(model_id)
 
+            current_ai_model_id = self._active_ai_model_by_model_id.get(model_id)
+            if current_ai_model_id and resolved_ai_model_id and current_ai_model_id != resolved_ai_model_id:
+                raise ModelPreparationError(
+                    stage="model_id_conflict",
+                    message=(
+                        f"Model '{model_id}' already active with ai_model_id='{current_ai_model_id}', "
+                        f"cannot switch to '{resolved_ai_model_id}' while active"
+                    ),
+                )
+
             if model_id not in self._owners:
-                self._start_owner(model_id)
+                self._start_owner(
+                    model_id=model_id,
+                    infer_config=infer_config_path or MODEL_CONFIG_MAP[model_id],
+                    ai_model_id=resolved_ai_model_id,
+                )
 
             self._clients[model_id].add(client_id)
 
@@ -126,7 +164,7 @@ class TritonModelManager:
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
-    def _start_owner(self, model_id: str):
+    def _start_owner(self, model_id: str, infer_config: str, ai_model_id: Optional[str] = None):
         """Must be called within self._lock."""
         if model_id not in MODEL_CONFIG_MAP:
             raise ValueError(
@@ -137,17 +175,22 @@ class TritonModelManager:
         print(f"[TritonModelManager] Starting owner for model '{model_id}'")
         owner = TritonModelOwner(
             model_id=model_id,
-            infer_config=MODEL_CONFIG_MAP[model_id],
+            infer_config=infer_config,
             gpu_id=self._gpu_id
         )
         owner.load()
         self._owners[model_id] = owner
         self._clients[model_id] = set()
+        self._resolved_infer_configs[model_id] = infer_config
+        if ai_model_id:
+            self._active_ai_model_by_model_id[model_id] = ai_model_id
 
     def _stop_owner(self, model_id: str):
         """Must be called within self._lock."""
         owner = self._owners.pop(model_id, None)
         self._clients.pop(model_id, None)
+        self._resolved_infer_configs.pop(model_id, None)
+        self._active_ai_model_by_model_id.pop(model_id, None)
 
         if owner:
             threading.Thread(
@@ -191,3 +234,58 @@ class TritonModelManager:
             self._idle_timers.pop(model_id, None)
             print(f"[TritonModelManager] Idle timeout reached — unloading model '{model_id}'")
             self._stop_owner(model_id)
+
+    def _ensure_model_ready(self, model_id: str, ai_model_id: Optional[str]):
+        if not ai_model_id:
+            if model_id in {"rfdetr", "rf_detr"}:
+                raise ModelPreparationError(
+                    stage="missing_ai_model_id",
+                    message="ai_model_id is required for rfdetr model access",
+                )
+            return MODEL_CONFIG_MAP.get(model_id), None
+
+        ai_model = self._ai_model_repository.get_ai_model_by_id(ai_model_id)
+        if ai_model is None:
+            raise ModelPreparationError(
+                stage="ai_model_not_found",
+                message=f"AI model not found for id={ai_model_id}",
+            )
+
+        model_type = (ai_model.type or "").strip().lower()
+        processor = self._model_processors.get(model_type)
+        if processor is None:
+            raise ModelPreparationError(
+                stage="unsupported_model_type",
+                message=f"No processor registered for ai_model.type='{ai_model.type}'",
+            )
+
+        normalized_model_id = model_id.replace("_", "")
+        normalized_model_type = model_type.replace("_", "")
+        if normalized_model_type != normalized_model_id:
+            print(
+                f"[WARN]  Requested model_id='{model_id}' differs from ai_model.type='{model_type}'. "
+                f"Using processor for '{model_type}'."
+            )
+
+        if not processor.is_ready(ai_model):
+            prepared = processor.prepare(ai_model)
+        else:
+            prepared = {
+                "infer_config_path": f"/app/config/deepstream-inferserver-rfdetr-{ai_model.id}.txt",
+            }
+
+        infer_config_path = prepared.get("infer_config_path")
+        if not infer_config_path:
+            raise ModelPreparationError(
+                stage="missing_infer_config_path",
+                message=f"Processor did not provide infer config path for ai_model_id={ai_model_id}",
+            )
+        return infer_config_path, ai_model.id
+
+    def _get_preparation_lock(self, ai_model_id: str) -> threading.Lock:
+        with self._prepare_locks_guard:
+            lock = self._prepare_locks.get(ai_model_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._prepare_locks[ai_model_id] = lock
+            return lock

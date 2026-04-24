@@ -7,7 +7,7 @@ from gi.repository import Gst
 
 MODEL_CONFIG_MAP: Dict[str, str] = {
     "yolo":   "/app/config/deepstream-inferserver-yolo.txt",
-    "rfdetr": "/app/config/deepstream-inferserver-yolo.txt",
+    "rfdetr": "/app/config/deepstream-inferserver-rfdetr-test.txt",
 }
 
 

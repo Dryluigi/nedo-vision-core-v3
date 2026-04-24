@@ -35,6 +35,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         infer_config: str,
         rtmp_uri: str,
         triton_model_manager: TritonModelManager,
+        ai_model_id: str | None,
         worker_id: str,
         worker_source_id: str,
         location_name: str | None,
@@ -55,6 +56,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self.infer_config   = infer_config
         self.rtmp_uri       = rtmp_uri
         self.worker_id      = worker_id
+        self.ai_model_id    = ai_model_id
         self.worker_source_id = worker_source_id
         self.location_name  = location_name or "LOCATION"
         self.output_width   = output_width
@@ -111,16 +113,25 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self._play_thread.start()
 
     def _play_background(self):
-        self.triton_model_manager.request_model_access(self.pipeline_id, "rfdetr")
+        try:
+            self.triton_model_manager.request_model_access(
+                self.pipeline_id, "rfdetr", self.ai_model_id
+            )
+            self.triton_model_manager.wait_model_till_ready("rfdetr")
 
-        self.triton_model_manager.wait_model_till_ready("rfdetr")
+            ret = self._pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("Pipeline failed to transition to PLAYING state.")
 
-        ret = self._pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            self._publish_status(PIPELINE_STATUS_STOPPED, "Pipeline failed to start")
-            raise RuntimeError("Pipeline failed to transition to PLAYING state.")
-
-        print(f"[INFO]  Pipeline started → {self.rtmp_uri}")
+            print(f"[INFO]  Pipeline started → {self.rtmp_uri}")
+        except Exception as exc:
+            self._publish_status(PIPELINE_STATUS_STOPPED, f"Pipeline error: {exc}")
+            self._pipeline.set_state(Gst.State.NULL)
+            try:
+                self.triton_model_manager.release_model_access(self.pipeline_id)
+            except Exception as release_exc:
+                print(f"[WARN]  Failed to release model access after startup error: {release_exc}")
+            return
 
     def stop(self):
         self._publish_status(PIPELINE_STATUS_STOPPING, "Pipeline is stopping")

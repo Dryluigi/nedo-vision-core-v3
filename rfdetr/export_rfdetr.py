@@ -2,6 +2,7 @@ import os
 import onnx
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from copy import deepcopy
 
 from rfdetr import RFDETRBase, RFDETRLarge, RFDETRNano, RFDETRSmall, RFDETRMedium
@@ -23,9 +24,11 @@ def MSDeformAttn_forward(
     query,
     reference_points,
     input_flatten,
-    input_spatial_shapes,
-    input_level_start_index,
-    input_padding_mask=None
+    input_spatial_shapes=None,
+    input_level_start_index=None,
+    input_padding_mask=None,
+    input_spatial_shapes_hw=None,
+    **kwargs,
 ):
     class MultiscaleDeformableAttnPlugin(torch.autograd.Function):
         @staticmethod
@@ -33,7 +36,9 @@ def MSDeformAttn_forward(
             value = value.permute(0, 2, 3, 1)
             N, Lq, M, L, P, n = sampling_locations.shape
             attention_weights = attention_weights.view(N, Lq, M, L * P)
-            return ms_deform_attn_core_pytorch(value, spatial_shapes, sampling_locations, attention_weights)
+            return _m2.ms_deform_attn_core_pytorch(
+                value, spatial_shapes, sampling_locations, attention_weights
+            )
 
         @staticmethod
         def symbolic(g, value, spatial_shapes, level_start_index, sampling_locations, attention_weights):
@@ -46,9 +51,14 @@ def MSDeformAttn_forward(
                 attention_weights
             )
 
+    # Newer RF-DETR code paths may pass this kwarg instead of input_spatial_shapes.
+    if input_spatial_shapes is None:
+        input_spatial_shapes = input_spatial_shapes_hw
+    if input_spatial_shapes is None:
+        raise ValueError("input_spatial_shapes is required")
+
     N, Len_q, _ = query.shape
     N, Len_in, _ = input_flatten.shape
-    assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
 
     value = self.value_proj(input_flatten)
     if input_padding_mask is not None:
@@ -149,13 +159,20 @@ def main(args):
     device = torch.device("cpu")
     model, nc, class_names = rfdetr_export(args.model, args.weights, args.size, device)
 
-    if len(class_names.keys()) > 0:
+    class_name_map = {}
+    if isinstance(class_names, dict):
+        class_name_map = class_names
+    elif isinstance(class_names, list):
+        # Convert list form into 1-based index map to match expected label order.
+        class_name_map = {idx + 1: name for idx, name in enumerate(class_names)}
+
+    if class_name_map:
         print("Creating labels.txt file")
         with open("labels.txt", "w", encoding="utf-8") as f:
             f.write("background\n")
             for i in range(1, nc + 1):
-                if i in class_names:
-                    f.write(f"{class_names[i]}\n")
+                if i in class_name_map:
+                    f.write(f"{class_name_map[i]}\n")
                 else:
                     f.write("empty\n")
 

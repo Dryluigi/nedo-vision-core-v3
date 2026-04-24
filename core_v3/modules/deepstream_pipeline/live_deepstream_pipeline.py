@@ -26,6 +26,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         rtsp_url: str,
         infer_config: str,
         triton_model_manager: TritonModelManager,
+        ai_model_id: str | None = None,
         worker_id: str | None = None,
         worker_source_id: str | None = None,
         location_name: str | None = None,
@@ -39,6 +40,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         output_height: int = 720,
     ):
         self._triton_model_manager = triton_model_manager
+        self._ai_model_id = ai_model_id
 
         self._play_thread = None
         self._is_playing = False
@@ -316,16 +318,25 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self._play_thread.start()
 
     def _play_background(self):
-        self._triton_model_manager.request_model_access(self._pipeline_id, "rfdetr")
+        try:
+            self._triton_model_manager.request_model_access(
+                self._pipeline_id, "rfdetr", self._ai_model_id
+            )
+            self._triton_model_manager.wait_model_till_ready("rfdetr")
 
-        self._triton_model_manager.wait_model_till_ready("rfdetr")
+            self._source_bin.sync_state_with_parent()
+            self._pipeline.set_state(Gst.State.PLAYING)
+            self._is_playing = True
 
-        self._source_bin.sync_state_with_parent()
-        self._pipeline.set_state(Gst.State.PLAYING)
-
-        self._is_playing = True
-
-        print(f"[INFO]  Pipeline started → {self._rtmp_location}")
+            print(f"[INFO]  Pipeline started → {self._rtmp_location}")
+        except Exception as exc:
+            self._publish_status(PIPELINE_STATUS_STOPPED, f"Pipeline error: {exc}")
+            self._pipeline.set_state(Gst.State.NULL)
+            try:
+                self._triton_model_manager.release_model_access(self._pipeline_id)
+            except Exception as release_exc:
+                print(f"[WARN]  Failed to release model access after startup error: {release_exc}")
+            return
 
     # -------------------------------------------------
     # STOP
@@ -342,6 +353,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         )
 
         self._pipeline.set_state(Gst.State.NULL)
+        self._triton_model_manager.release_model_access(self._pipeline_id)
         if self._capture_processing_service is not None:
             self._capture_processing_service.stop_worker(self._pipeline_id)
 

@@ -89,6 +89,15 @@
 2. Log command, exit code, stderr per stage.
 3. Do not start owner when preparation fails.
 
+## 9A. Failure Propagation Requirement
+1. If model preparation fails for a requested model, `request_model_access` must fail immediately.
+2. `TritonModelManager.request_model_access(...)` must re-raise preparation errors (do not swallow).
+3. Pipeline startup (`_play_background`) must catch this error and publish stop event immediately.
+4. Listener-visible payload must include:
+   1. `status: stop`
+   2. clear failure message (example: `Pipeline error: model preparation failed (trt_build_failed)`).
+5. Startup thread must return immediately after publishing the error (no transition to `PLAYING`).
+
 ## 10. Extensibility for YOLO
 1. Add `YoloDeepstreamModelProcessor` implementing same interface.
 2. Add templates for YOLO trt/ensemble/infer config.

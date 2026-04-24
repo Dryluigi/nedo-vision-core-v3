@@ -5,7 +5,7 @@ from rfdetr import RFDETRNano, RFDETRSmall, RFDETRMedium, RFDETRBase, RFDETRLarg
 
 MODEL_PATH = "/app/raw_models/ai-model_20251027_040415_a45752f9-fa10-471f-87f5-a9858be906d6.pth"
 ONNX_OUTPUT = "rfdetr_raw.onnx"
-IMG_SIZE = 576  # must match training resolution
+IMG_SIZE = 640  # must match training resolution
 
 
 # -------------------------------------------------

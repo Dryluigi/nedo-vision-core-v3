@@ -89,6 +89,9 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             person_conf_threshold=0.5,
             attribute_conf_threshold=0.5,
         )
+        infer_config_path = (
+            f"/app/config/deepstream-inferserver-rfdetr-{pipeline.ai_model_id}.txt"
+        )
 
         if source.type_code == "live":
             pipeline = LiveRtspDeepstreamPipeline(
@@ -96,8 +99,9 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 f"{pipeline.name}",
                 self._deepstream_pipelines_update_queue,
                 source.url,
-                "/app/config/deepstream-inferserver-rfdetr.txt",
+                infer_config_path,
                 self._triton_model_manager,
+                pipeline.ai_model_id,
                 pipeline.worker_id,
                 source.id,
                 location_name,
@@ -122,10 +126,10 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 f"{pipeline.name}",
                 self._deepstream_pipelines_update_queue,
                 file_url,
-                # "/app/config/deepstream-inferserver-yolo.txt",
-                "/app/config/deepstream-inferserver-rfdetr.txt",
+                infer_config_path,
                 RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}"),
                 self._triton_model_manager,
+                pipeline.ai_model_id,
                 pipeline.worker_id,
                 source.id,
                 location_name,
