@@ -4,6 +4,7 @@ from typing import Dict, Set, Optional
 from .triton_model_owner import TritonModelOwner
 from ...repositories.AIModelRepository import AIModelRepository
 from ..triton_model_converter.model_preparation_error import ModelPreparationError
+from ..triton_model_converter.rfdetr_artifact_layout import get_rfdetr_infer_config_path
 from ..triton_model_converter.rfdetr_triton_model_converter import RfdetrTritonModelConverter
 
 
@@ -271,7 +272,7 @@ class TritonModelManager:
             prepared = processor.prepare(ai_model)
         else:
             prepared = {
-                "infer_config_path": f"/app/config/deepstream-inferserver-rfdetr-{ai_model.id}.txt",
+                "infer_config_path": get_rfdetr_infer_config_path(ai_model.id),
             }
 
         infer_config_path = prepared.get("infer_config_path")

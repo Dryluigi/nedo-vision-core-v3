@@ -9,6 +9,7 @@ from ..deepstream_pipeline.file_deepstream_pipeline import FileDeepstreamPipelin
 from ..deepstream_pipeline.live_deepstream_pipeline import LiveRtspDeepstreamPipeline
 from ..deepstream_pipeline.constant import PIPELINE_STATUS_RUNNING, PIPELINE_STATUS_STARTING, PIPELINE_STATUS_STOPPED, PIPELINE_STATUS_STOPPING
 from ..triton_model_manager.triton_model_manager import TritonModelManager
+from ..triton_model_converter.rfdetr_artifact_layout import get_rfdetr_infer_config_path
 from ..deepstream_pipeline.person_attribute_aggregator import PersonAttributeAggregator
 from ..deepstream_pipeline.capture_decision_engine import CaptureDecisionEngine
 from ..capture_processing_service.capture_processing_service import CaptureProcessingService
@@ -89,9 +90,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             person_conf_threshold=0.5,
             attribute_conf_threshold=0.5,
         )
-        infer_config_path = (
-            f"/app/config/deepstream-inferserver-rfdetr-{pipeline.ai_model_id}.txt"
-        )
+        infer_config_path = get_rfdetr_infer_config_path(pipeline.ai_model_id)
 
         if source.type_code == "live":
             pipeline = LiveRtspDeepstreamPipeline(

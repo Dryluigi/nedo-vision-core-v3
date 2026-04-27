@@ -1,11 +1,17 @@
 import json
+import logging
+import shutil
 import subprocess
 from pathlib import Path
-import logging
 
 from ...models.ai_model import AIModelEntity
-from .triton_model_converter_interface import TritonModelConverterInterface
 from .model_preparation_error import ModelPreparationError
+from .rfdetr_artifact_layout import (
+    DEFAULT_MODEL_ARTIFACT_ROOT,
+    DEFAULT_SHARED_MODEL_ROOT,
+    get_rfdetr_artifact_paths,
+)
+from .triton_model_converter_interface import TritonModelConverterInterface
 
 
 class RfdetrTritonModelConverter(TritonModelConverterInterface):
@@ -13,14 +19,16 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
         self,
         raw_model_root: str = "/app/raw_models",
         converter_script_root: str = "/app/core_v3/scripts",
-        triton_model_root: str = "/app/models",
-        config_root: str = "/app/config",
+        triton_model_root: str = str(DEFAULT_MODEL_ARTIFACT_ROOT),
+        config_root: str | None = None,
+        shared_model_root: str = str(DEFAULT_SHARED_MODEL_ROOT),
         image_size: int = 640,
     ):
         self._raw_model_root = Path(raw_model_root)
         self._converter_script_root = Path(converter_script_root)
         self._triton_model_root = Path(triton_model_root)
-        self._config_root = Path(config_root)
+        self._config_root = Path(config_root) if config_root else None
+        self._shared_model_root = Path(shared_model_root)
         self._image_size = image_size
 
     def is_ready(self, ai_model: AIModelEntity) -> bool:
@@ -37,6 +45,8 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
             paths["infer_config_path"],
             paths["labels_path"],
             paths["manifest_path"],
+            paths["postprocess_model_dir"] / "config.pbtxt",
+            paths["postprocess_model_dir"] / "1" / "model.py",
         ]
         if not all(p.exists() and p.stat().st_size > 0 for p in required_paths):
             return False
@@ -75,13 +85,15 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
             weights_path,
         )
 
+        paths["triton_repo_root"].mkdir(parents=True, exist_ok=True)
         paths["trt_model_dir"].mkdir(parents=True, exist_ok=True)
         paths["trt_model_version_dir"].mkdir(parents=True, exist_ok=True)
         paths["ensemble_model_dir"].mkdir(parents=True, exist_ok=True)
         paths["ensemble_model_version_dir"].mkdir(parents=True, exist_ok=True)
-        self._config_root.mkdir(parents=True, exist_ok=True)
+        paths["config_root"].mkdir(parents=True, exist_ok=True)
 
         self._cleanup_temp_artifacts(paths)
+        self._ensure_shared_postprocess_model(paths)
         paths["inprogress_path"].write_text("building", encoding="utf-8")
 
         try:
@@ -147,6 +159,7 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
                 self._render_infer_config(
                     ensemble_model_name=paths["ensemble_model_name"],
                     labels_path=paths["labels_path"],
+                    model_repo_root=paths["triton_repo_root"],
                 ),
             )
             self._write_manifest(paths)
@@ -181,46 +194,60 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
             weights_path = weights_path.with_suffix(".pth")
         onnx_path = weights_path.with_suffix(".onnx")
 
-        model_key = ai_model.id
-        trt_model_name = f"rfdetr_trt_{model_key}"
-        ensemble_model_name = f"rfdetr_ensemble_{model_key}"
+        layout_paths = get_rfdetr_artifact_paths(
+            ai_model_id=ai_model.id,
+            artifact_root=self._triton_model_root,
+            shared_model_root=self._shared_model_root,
+        )
+        if self._config_root is not None:
+            config_root = self._config_root / "rfdetr" / ai_model.id
+            layout_paths["config_root"] = config_root
+            layout_paths["infer_config_path"] = config_root / Path(layout_paths["infer_config_path"]).name
+            layout_paths["labels_path"] = config_root / Path(layout_paths["labels_path"]).name
+            layout_paths["manifest_path"] = config_root / Path(layout_paths["manifest_path"]).name
+            layout_paths["inprogress_path"] = config_root / Path(layout_paths["inprogress_path"]).name
 
-        trt_model_dir = self._triton_model_root / trt_model_name
-        trt_model_version_dir = trt_model_dir / "1"
+        trt_model_dir = Path(layout_paths["trt_model_dir"])
+        trt_model_version_dir = Path(layout_paths["trt_model_version_dir"])
         plan_path = trt_model_version_dir / "model.plan"
         plan_tmp_path = trt_model_version_dir / "model.plan.tmp"
         trt_config_path = trt_model_dir / "config.pbtxt"
         trt_config_tmp_path = trt_model_dir / "config.pbtxt.tmp"
 
-        ensemble_model_dir = self._triton_model_root / ensemble_model_name
-        ensemble_model_version_dir = ensemble_model_dir / "1"
+        ensemble_model_dir = Path(layout_paths["ensemble_model_dir"])
+        ensemble_model_version_dir = Path(layout_paths["ensemble_model_version_dir"])
         ensemble_config_path = ensemble_model_dir / "config.pbtxt"
         ensemble_config_tmp_path = ensemble_model_dir / "config.pbtxt.tmp"
 
-        labels_path = self._config_root / f"rfdetr-labels-{model_key}.txt"
-        labels_tmp_path = self._config_root / f"rfdetr-labels-{model_key}.txt.tmp"
-        infer_config_path = self._config_root / f"deepstream-inferserver-rfdetr-{model_key}.txt"
-        infer_config_tmp_path = self._config_root / f"deepstream-inferserver-rfdetr-{model_key}.txt.tmp"
-        manifest_path = self._config_root / f"rfdetr-manifest-{model_key}.json"
-        manifest_tmp_path = self._config_root / f"rfdetr-manifest-{model_key}.json.tmp"
-        inprogress_path = self._config_root / f"rfdetr-build-{model_key}.inprogress"
+        labels_path = Path(layout_paths["labels_path"])
+        labels_tmp_path = labels_path.with_name(f"{labels_path.name}.tmp")
+        infer_config_path = Path(layout_paths["infer_config_path"])
+        infer_config_tmp_path = infer_config_path.with_name(f"{infer_config_path.name}.tmp")
+        manifest_path = Path(layout_paths["manifest_path"])
+        manifest_tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+        inprogress_path = Path(layout_paths["inprogress_path"])
 
         return {
+            "artifact_dir": Path(layout_paths["artifact_dir"]),
             "weights_path": weights_path,
             "onnx_path": onnx_path,
             "onnx_tmp_path": onnx_path.with_suffix(".onnx.tmp"),
-            "trt_model_name": trt_model_name,
+            "triton_repo_root": Path(layout_paths["triton_repo_root"]),
+            "config_root": Path(layout_paths["config_root"]),
+            "trt_model_name": layout_paths["trt_model_name"],
             "trt_model_dir": trt_model_dir,
             "trt_model_version_dir": trt_model_version_dir,
             "plan_path": plan_path,
             "plan_tmp_path": plan_tmp_path,
             "trt_config_path": trt_config_path,
             "trt_config_tmp_path": trt_config_tmp_path,
-            "ensemble_model_name": ensemble_model_name,
+            "ensemble_model_name": layout_paths["ensemble_model_name"],
             "ensemble_model_dir": ensemble_model_dir,
             "ensemble_model_version_dir": ensemble_model_version_dir,
             "ensemble_config_path": ensemble_config_path,
             "ensemble_config_tmp_path": ensemble_config_tmp_path,
+            "postprocess_model_dir": Path(layout_paths["postprocess_model_dir"]),
+            "shared_postprocess_model_dir": Path(layout_paths["shared_postprocess_model_dir"]),
             "labels_path": labels_path,
             "labels_tmp_path": labels_tmp_path,
             "infer_config_path": infer_config_path,
@@ -229,6 +256,20 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
             "manifest_tmp_path": manifest_tmp_path,
             "inprogress_path": inprogress_path,
         }
+
+    def _ensure_shared_postprocess_model(self, paths: dict):
+        shared_dir = paths["shared_postprocess_model_dir"]
+        target_dir = paths["postprocess_model_dir"]
+        if not shared_dir.exists():
+            raise ModelPreparationError(
+                stage="missing_postprocess_model",
+                message=f"Shared postprocess model not found: {shared_dir}",
+            )
+
+        if target_dir.exists():
+            return
+
+        shutil.copytree(shared_dir, target_dir)
 
     def _atomic_write_text(self, path: Path, content: str):
         path.write_text(content, encoding="utf-8")
@@ -262,6 +303,7 @@ class RfdetrTritonModelConverter(TritonModelConverterInterface):
             "plan_path": str(paths["plan_path"]),
             "labels_path": str(paths["labels_path"]),
             "infer_config_path": str(paths["infer_config_path"]),
+            "triton_repo_root": str(paths["triton_repo_root"]),
         }
         paths["manifest_tmp_path"].write_text(
             json.dumps(manifest, indent=2, sort_keys=True),
@@ -436,7 +478,11 @@ ensemble_scheduling {{
 """
 
     @staticmethod
-    def _render_infer_config(ensemble_model_name: str, labels_path: Path) -> str:
+    def _render_infer_config(
+        ensemble_model_name: str,
+        labels_path: Path,
+        model_repo_root: Path,
+    ) -> str:
         return f"""infer_config {{
   unique_id: 2
   max_batch_size: 1
@@ -446,7 +492,7 @@ ensemble_scheduling {{
       model_name: "{ensemble_model_name}"
       version: -1
       model_repo {{
-        root: "/app/models"
+        root: "{model_repo_root}"
       }}
     }}
   }}
