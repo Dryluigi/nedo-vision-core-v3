@@ -148,6 +148,11 @@ def run_core_service(args):
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    )
     
     logger = logging.getLogger(__name__)
     
