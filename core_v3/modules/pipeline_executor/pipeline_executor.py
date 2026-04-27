@@ -21,6 +21,7 @@ from ...utils.RTMPUrl import RTMPUrl
 class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface, SourceSyncNotifierInterface):
     DEFAULT_OUTPUT_WIDTH = 1280
     DEFAULT_OUTPUT_HEIGHT = 720
+    DEFAULT_OUTPUT_FPS = 30
 
     def __init__(
             self,
@@ -56,6 +57,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         output_width, output_height = self._parse_resolution(
             source.resolution
         )
+        output_fps = self._parse_frame_rate(source.frame_rate)
 
         # Create deepstream pipeline
         frame_drawer = FrameDrawer()
@@ -112,6 +114,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 RTMPUrl.get_publish_url(f"pipeline-{pipeline.id}"),
                 output_width=output_width,
                 output_height=output_height,
+                target_fps=output_fps,
             )
 
             self._pipelines[pipeline_id] = pipeline
@@ -139,6 +142,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
                 class_id_to_label,
                 output_width=output_width,
                 output_height=output_height,
+                target_fps=output_fps,
             )
 
             self._pipelines[pipeline_id] = pipeline
@@ -241,6 +245,21 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             return cls.DEFAULT_OUTPUT_WIDTH, cls.DEFAULT_OUTPUT_HEIGHT
 
         return width, height
+
+    @classmethod
+    def _parse_frame_rate(cls, frame_rate: float | None) -> int:
+        if frame_rate is None:
+            return cls.DEFAULT_OUTPUT_FPS
+
+        try:
+            parsed = int(round(float(frame_rate)))
+        except (TypeError, ValueError):
+            return cls.DEFAULT_OUTPUT_FPS
+
+        if parsed <= 0:
+            return cls.DEFAULT_OUTPUT_FPS
+
+        return parsed
 
     def  _listen_pipeline_status_update_queue(self):
         while True:

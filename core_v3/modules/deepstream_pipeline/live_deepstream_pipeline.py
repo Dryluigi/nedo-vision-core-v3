@@ -38,6 +38,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         rtmp_location: str = "rtmp://host.containers.internal:1935/live/cctv-5",
         output_width: int = 1280,
         output_height: int = 720,
+        target_fps: int = 30,
     ):
         self._triton_model_manager = triton_model_manager
         self._ai_model_id = ai_model_id
@@ -55,6 +56,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self._rtmp_location = rtmp_location
         self._output_width = output_width
         self._output_height = output_height
+        self._target_fps = target_fps
         self._worker_id = worker_id
         self._worker_source_id = worker_source_id
         self._location_name = location_name or pipeline_name
@@ -80,6 +82,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             preview_style_hold_seconds=3.0,
         )
         self._capture_appsink = None
+        self._rtmp_sink_pad = None
         self._capture_worker = None
         if self._capture_processing_service is not None:
             self._capture_worker = self._capture_processing_service.get_or_create_worker(
@@ -154,23 +157,22 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
         self.encoder = Gst.ElementFactory.make("nvv4l2h264enc", "h264-encoder")
         self.encoder.set_property("bitrate", 4000000)
-        self.encoder.set_property("iframeinterval", 30)
+        self.encoder.set_property("iframeinterval", max(1, self._target_fps * 2))
 
         self.h264parse = Gst.ElementFactory.make("h264parse", "h264parse")
-        h264_src_pad = self.h264parse.get_static_pad("src")
-        h264_src_pad.add_probe(
-            Gst.PadProbeType.BUFFER,
-            self._first_frame_probe,
-            None
-        )
-
 
         self.flvmux = Gst.ElementFactory.make("flvmux", "flvmux")
         self.flvmux.set_property("streamable", True)
 
         self.rtmpsink = Gst.ElementFactory.make("rtmpsink", "rtmpsink")
         self.rtmpsink.set_property("location", self._rtmp_location)
-        self.rtmpsink.set_property("sync", True)
+        self.rtmpsink.set_property("sync", False)
+        self._rtmp_sink_pad = self.rtmpsink.get_static_pad("sink")
+        self._rtmp_sink_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._first_frame_probe,
+            None
+        )
 
         # Add elements
         elements = [
@@ -587,7 +589,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
             self._publish_status(
                 PIPELINE_STATUS_RUNNING,
-                "Pipeline is running (frames reaching RTMP)"
+                "Pipeline is running (frames reached RTMP sink)"
             )
 
         return Gst.PadProbeReturn.OK

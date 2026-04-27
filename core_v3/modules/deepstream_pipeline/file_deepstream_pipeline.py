@@ -77,7 +77,7 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         self._first_frame_sent   = False
         
         self._osd_pad = None
-        self._h264_src_pad = None
+        self._rtmp_sink_pad = None
         self._first_frame_probe_id = None
         self._osd_probe_id = None
         self._capture_appsink = None
@@ -139,8 +139,8 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         if self._osd_probe_id:
             self._osd_pad.remove_probe(self._osd_probe_id)
 
-        if self._first_frame_probe_id:
-            self._h264_src_pad.remove_probe(self._first_frame_probe_id)
+        if self._first_frame_probe_id and self._rtmp_sink_pad:
+            self._rtmp_sink_pad.remove_probe(self._first_frame_probe_id)
 
         self._pipeline.send_event(Gst.Event.new_eos())
         self._pipeline.set_state(Gst.State.NULL)
@@ -279,18 +279,11 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         # 11. GPU H.264 encoder
         encoder = self._make("nvv4l2h264enc", "h264-encoder")
         encoder.set_property("bitrate",        self.encode_bitrate * 1000)
-        encoder.set_property("iframeinterval", self.target_fps * 2)
+        encoder.set_property("iframeinterval", max(1, self.target_fps * 2))
 
-        # 12. H.264 parser — first-frame probe attached here to detect
-        #     when encoded frames are actually reaching the muxer/RTMP
+        # 12. H.264 parser
         h264parse = self._make("h264parse", "h264-parse")
         h264parse.set_property("config-interval", -1)
-        self._h264_src_pad = h264parse.get_static_pad("src")
-        self._first_frame_probe_id = self._h264_src_pad.add_probe(
-            Gst.PadProbeType.BUFFER,
-            self._first_frame_probe,
-            None,
-        )
 
         # 13. FLV muxer
         flvmux = self._make("flvmux", "flv-mux")
@@ -299,8 +292,14 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
         # 14. RTMP sink
         rtmpsink = self._make("rtmpsink", "rtmp-sink")
         rtmpsink.set_property("location", self.rtmp_uri)
-        rtmpsink.set_property("sync",  True)
+        rtmpsink.set_property("sync",  False)
         rtmpsink.set_property("async", False)
+        self._rtmp_sink_pad = rtmpsink.get_static_pad("sink")
+        self._first_frame_probe_id = self._rtmp_sink_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._first_frame_probe,
+            None,
+        )
 
         # Add & link
         for el in [mux_conv, mux_caps, pgie, tracker,
@@ -375,12 +374,12 @@ class FileDeepstreamPipeline(DeepstreamPipelineInterface):
     # ── Probes ───────────────────────────────────────────────────────────────
 
     def _first_frame_probe(self, pad, info, user_data):
-        """Fires once when the first encoded frame exits h264parse → RTMP."""
+        """Fires once when the first buffer reaches the RTMP sink."""
         if not self._first_frame_sent:
             self._first_frame_sent = True
             self._publish_status(
                 PIPELINE_STATUS_RUNNING,
-                "Pipeline is running (frames reaching RTMP)",
+                "Pipeline is running (frames reached RTMP sink)",
             )
         return Gst.PadProbeReturn.OK
 
