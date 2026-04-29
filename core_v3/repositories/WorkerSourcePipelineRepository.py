@@ -109,6 +109,38 @@ class WorkerSourcePipelineRepository(BaseRepository):
         except SQLAlchemyError as e:
             print(f"Database error while retrieving pipeline configs: {e}")
             return {}
+
+    def get_all_pipeline_configs_grouped(self):
+        try:
+            with self._get_session() as session:
+                pipeline_configs = session.query(WorkerSourcePipelineConfigEntity).all()
+
+                def parse_value(value):
+                    if not value:
+                        return value
+
+                    value = value.strip()
+                    if (value.startswith("{") and value.endswith("}")) or (value.startswith("[") and value.endswith("]")):
+                        try:
+                            return json.loads(value)
+                        except json.JSONDecodeError:
+                            pass
+                    return value
+
+                grouped_configs = {}
+                for config in pipeline_configs:
+                    grouped_configs.setdefault(config.worker_source_pipeline_id, {})[config.pipeline_config_code] = {
+                        "id": config.id,
+                        "is_enabled": config.is_enabled,
+                        "value": parse_value(config.value),
+                        "name": config.pipeline_config_name,
+                    }
+
+                return grouped_configs
+
+        except SQLAlchemyError as e:
+            print(f"Database error while retrieving all pipeline configs: {e}")
+            return {}
         
     def get_worker_source_pipeline(self, pipeline_id):
         with self._get_session() as session:

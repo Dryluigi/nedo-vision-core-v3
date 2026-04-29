@@ -18,6 +18,10 @@ from ...repositories.WorkerSourcePipelineRepository import WorkerSourcePipelineR
 from ...repositories.WorkerSourceRepository import WorkerSourceRepository
 from ...utils.RTMPUrl import RTMPUrl
 
+
+PIPELINE_STATUS_RESTARTING = "restarting"
+
+
 class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface, SourceSyncNotifierInterface):
     DEFAULT_OUTPUT_WIDTH = 1280
     DEFAULT_OUTPUT_HEIGHT = 720
@@ -49,9 +53,13 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         pipeline = self._pipeline_repository.get_pipeline_by_id(pipeline_id)
         if not pipeline:
             return
-        
+
         source = self._source_repository.get_worker_source(pipeline.worker_source_id)
-        if not pipeline:
+        if not source:
+            print(f"Cannot start pipeline {pipeline_id}: source not found")
+            return
+        if (source.status_code or "").strip().lower() == "stopped":
+            print(f"Skipping start for pipeline {pipeline_id}: source is stopped")
             return
 
         output_width, output_height = self._parse_resolution(
@@ -151,19 +159,35 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         self._pipelines[pipeline_id].play()
 
     def stop(self, pipeline_id: str):
-        self._pipelines[pipeline_id].stop()
+        pipeline = self._pipelines.get(pipeline_id)
+        if pipeline is None:
+            return
+        pipeline.stop()
         del self._pipelines[pipeline_id]
 
     def restart(self, pipeline_id: str):
-        pass
+        if pipeline_id in self._pipelines:
+            self.stop(pipeline_id)
+        self.start(pipeline_id)
 
     def notify_pipeline_update(self, updated_pipeline_id: str):
         pipeline = self._pipeline_repository.get_pipeline_by_id(updated_pipeline_id)
         if not pipeline:
             return
-    
+
+        snapshot = None
+        change = None
+        if self._pipeline_sync_service is not None:
+            snapshot = self._pipeline_sync_service.get_pipeline_snapshot(updated_pipeline_id)
+            change = self._pipeline_sync_service.get_last_change(updated_pipeline_id)
+
+        source_stopped = bool(change and change.get("source_stopped"))
+
         # If pipeline never been started, start directly.
         if pipeline.id not in self._pipelines:
+            if source_stopped:
+                self._pipeline_sync_service.update_pipeline_status(updated_pipeline_id, PIPELINE_STATUS_STOPPED)
+                return
             if pipeline.pipeline_status_code in [PIPELINE_STATUS_STARTING, PIPELINE_STATUS_RUNNING]:
                 self.start(updated_pipeline_id)
 
@@ -171,6 +195,21 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
 
         pipeline_metadata = self._pipelines[pipeline.id].get_metadata()
         active_pipeline_status = pipeline_metadata["pipeline_status"]
+
+        if source_stopped:
+            print(f"Stopping pipeline {pipeline.id}: source is stopped")
+            self.stop(pipeline.id)
+            self._pipeline_sync_service.update_pipeline_status(updated_pipeline_id, PIPELINE_STATUS_STOPPED)
+            return
+
+        if active_pipeline_status == PIPELINE_STATUS_RESTARTING:
+            print(f"Ignoring update for pipeline {pipeline.id}: pipeline is restarting")
+            return
+
+        if change and change.get("requires_restart") and pipeline.pipeline_status_code in [PIPELINE_STATUS_STARTING, PIPELINE_STATUS_RUNNING]:
+            print(f"Restarting pipeline {pipeline.id} because {change.get('reasons', [])}")
+            self.restart(updated_pipeline_id)
+            return
 
         # If pipeline already running here and metadata is changed, then restart it.
         if (
@@ -206,15 +245,24 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         pipeline = self._pipeline_repository.get_pipeline_by_id(new_pipeline_id)
         if not pipeline:
             return
-        
+
+        snapshot = None
+        if self._pipeline_sync_service is not None:
+            snapshot = self._pipeline_sync_service.get_pipeline_snapshot(new_pipeline_id)
+        source_status = (((snapshot or {}).get("source") or {}).get("status_code") or "").strip().lower()
+
+        if source_status == "stopped":
+            self._pipeline_sync_service.update_pipeline_status(new_pipeline_id, PIPELINE_STATUS_STOPPED)
+            return
+
         # It means run action being triggered.
-        if pipeline.pipeline_status_code == PIPELINE_STATUS_STARTING:
+        if pipeline.pipeline_status_code in [PIPELINE_STATUS_STARTING, PIPELINE_STATUS_RUNNING]:
             self.start(new_pipeline_id)
         else:
-            self._pipeline_sync_service.update_pipeline_status(new_pipeline_id, "stop")
+            self._pipeline_sync_service.update_pipeline_status(new_pipeline_id, PIPELINE_STATUS_STOPPED)
 
     def notify_deleted_pipeline(self, deleted_pipeline_id: str):
-        pass
+        self.stop(deleted_pipeline_id)
 
     def notify_source_status_update(self, source_id: str, before_status: str, after_status: str):
         pass
@@ -264,7 +312,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
     def  _listen_pipeline_status_update_queue(self):
         while True:
             data = self._deepstream_pipelines_update_queue.get()
-            
+
             print(f"Obtain status data from pipeline {data}")
             if data["status"] == PIPELINE_STATUS_RUNNING or data["status"] == PIPELINE_STATUS_STOPPED:
                 self._pipeline_sync_service.update_pipeline_status(data["pipeline_id"], data["status"])
