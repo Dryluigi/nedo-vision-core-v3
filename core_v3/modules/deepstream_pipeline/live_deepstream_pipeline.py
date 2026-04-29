@@ -45,6 +45,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
         self._play_thread = None
         self._is_playing = False
+        self._stop_requested = False
         self._status = PIPELINE_STATUS_STOPPED
         self._first_frame_sent = False
 
@@ -82,7 +83,15 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             preview_style_hold_seconds=3.0,
         )
         self._capture_appsink = None
+        self._capture_bin = None
+        self._capture_bin_sink_pad = None
+        self._capture_branch_pad = None
+        self._post_tee = None
+        self._osd_pad = None
+        self._osd_probe_id = None
         self._rtmp_sink_pad = None
+        self._first_frame_probe_id = None
+        self._streammux_sink_pad = None
         self._capture_worker = None
         if self._capture_processing_service is not None:
             self._capture_worker = self._capture_processing_service.get_or_create_worker(
@@ -168,7 +177,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self.rtmpsink.set_property("location", self._rtmp_location)
         self.rtmpsink.set_property("sync", False)
         self._rtmp_sink_pad = self.rtmpsink.get_static_pad("sink")
-        self._rtmp_sink_pad.add_probe(
+        self._first_frame_probe_id = self._rtmp_sink_pad.add_probe(
             Gst.PadProbeType.BUFFER,
             self._first_frame_probe,
             None
@@ -184,10 +193,6 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             self.conv_caps,
             self.post_tee,
             self.osd_queue,
-            self.capture_queue,
-            self.capture_conv,
-            self.capture_caps,
-            self.capture_appsink,
             self.osd,
             self.enc_conv,
             self.enc_caps,
@@ -207,18 +212,20 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self.tracker.link(self.conv)
         self.conv.link(self.conv_caps)
         self.conv_caps.link(self.post_tee)
+        self._post_tee = self.post_tee
         tee_osd_pad = self.post_tee.get_request_pad("src_%u")
         osd_queue_pad = self.osd_queue.get_static_pad("sink")
         if not tee_osd_pad or not osd_queue_pad or tee_osd_pad.link(osd_queue_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError("Failed to link live tee to OSD branch")
+        self._capture_bin = self._build_capture_bin()
+        self._pipeline.add(self._capture_bin)
         tee_capture_pad = self.post_tee.get_request_pad("src_%u")
-        capture_queue_pad = self.capture_queue.get_static_pad("sink")
-        if not tee_capture_pad or not capture_queue_pad or tee_capture_pad.link(capture_queue_pad) != Gst.PadLinkReturn.OK:
+        capture_bin_sink_pad = self._capture_bin.get_static_pad("sink")
+        if not tee_capture_pad or not capture_bin_sink_pad or tee_capture_pad.link(capture_bin_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError("Failed to link live tee to capture branch")
+        self._capture_branch_pad = tee_capture_pad
+        self._capture_bin_sink_pad = capture_bin_sink_pad
         self.osd_queue.link(self.osd)
-        self.capture_queue.link(self.capture_conv)
-        self.capture_conv.link(self.capture_caps)
-        self.capture_caps.link(self.capture_appsink)
         self.osd.link(self.enc_conv)
         self.enc_conv.link(self.enc_caps)
         self.enc_caps.link(self.encoder)
@@ -228,7 +235,8 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
         # Add OSD probe
         osd_sink_pad = self.osd.get_static_pad("sink")
-        osd_sink_pad.add_probe(
+        self._osd_pad = osd_sink_pad
+        self._osd_probe_id = osd_sink_pad.add_probe(
             Gst.PadProbeType.BUFFER,
             self._osd_probe,
             None,
@@ -298,7 +306,8 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
 
         if self._is_playing:
             return
-        
+
+        self._stop_requested = False
         self._publish_status(
             PIPELINE_STATUS_STARTING,
             "Pipeline is starting"
@@ -313,6 +322,7 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
         self._pipeline.add(self._source_bin)
 
         sink_pad = self.streammux.request_pad_simple("sink_0")
+        self._streammux_sink_pad = sink_pad
         src_pad = self._source_bin.get_static_pad("src")
         src_pad.link(sink_pad)
 
@@ -326,8 +336,17 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
             )
             self._triton_model_manager.wait_model_till_ready("rfdetr")
 
+            if self._stop_requested:
+                try:
+                    self._triton_model_manager.release_model_access(self._pipeline_id)
+                except Exception as release_exc:
+                    print(f"[WARN]  Failed to release model access after stop request: {release_exc}")
+                return
+
             self._source_bin.sync_state_with_parent()
-            self._pipeline.set_state(Gst.State.PLAYING)
+            ret = self._pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("Pipeline failed to transition to PLAYING state.")
             self._is_playing = True
 
             print(f"[INFO]  Pipeline started → {self._rtmp_location}")
@@ -345,37 +364,209 @@ class LiveRtspDeepstreamPipeline(DeepstreamPipelineInterface):
     # -------------------------------------------------
 
     def stop(self):
-
-        if not self._is_playing:
-            return
-        
+        self._stop_requested = True
         self._publish_status(
             PIPELINE_STATUS_STOPPING,
             "Pipeline is stopping"
         )
+        pipeline = self._pipeline
+        if pipeline is None:
+            self._publish_status(PIPELINE_STATUS_STOPPED, "Pipeline stopped")
+            return
 
-        self._pipeline.set_state(Gst.State.NULL)
-        self._triton_model_manager.release_model_access(self._pipeline_id)
-        if self._capture_processing_service is not None:
-            self._capture_processing_service.stop_worker(self._pipeline_id)
+        try:
+            self._stop_capture_branch()
+            self._remove_probe(self._osd_pad, "_osd_probe_id")
+            self._remove_probe(self._rtmp_sink_pad, "_first_frame_probe_id")
+            self._safe_set_pipeline_null(pipeline)
 
-        # Release streammux pad
-        if self.streammux:
-            sinkpad = self.streammux.get_static_pad("sink_0")
-            if sinkpad:
-                self.streammux.release_request_pad(sinkpad)
+            try:
+                self._triton_model_manager.release_model_access(self._pipeline_id)
+            except Exception as release_exc:
+                print(f"[WARN]  Failed to release model access while stopping: {release_exc}")
 
-        # Remove source bin
-        if self._source_bin:
-            self._pipeline.remove(self._source_bin)
-            self._source_bin = None
+            if self._capture_processing_service is not None:
+                try:
+                    self._capture_processing_service.stop_worker(self._pipeline_id)
+                except Exception:
+                    pass
 
-        self._is_playing = False
+            self._release_streammux_pad()
 
-        self._publish_status(
-            PIPELINE_STATUS_STOPPED,
-            "Pipeline stopped"
+            if self._source_bin is not None:
+                try:
+                    pipeline.remove(self._source_bin)
+                except Exception:
+                    pass
+                self._source_bin = None
+
+            self._is_playing = False
+            self._clear_runtime_references()
+
+            if self._play_thread and self._play_thread.is_alive() and threading.current_thread() is not self._play_thread:
+                self._play_thread.join(timeout=1.0)
+
+        finally:
+            self._publish_status(
+                PIPELINE_STATUS_STOPPED,
+                "Pipeline stopped"
+            )
+            print("[INFO]  Pipeline stopped.", flush=True)
+
+    def _stop_capture_branch(self):
+        if self._capture_appsink is not None:
+            self._capture_appsink.set_property("emit-signals", False)
+
+        self._set_element_state_with_timeout(
+            element=self._capture_bin,
+            target_state=Gst.State.NULL,
+            timeout_seconds=5.0,
+            thread_name=f"live-capture-bin-null-{self._pipeline_id}",
+            label="capture bin",
         )
+
+        self._detach_capture_branch()
+
+    def _safe_set_pipeline_null(self, pipeline):
+        timed_out, error = self._set_element_state_with_timeout(
+            element=pipeline,
+            target_state=Gst.State.NULL,
+            timeout_seconds=10.0,
+            thread_name=f"live-set-null-{self._pipeline_id}",
+            label="pipeline",
+        )
+        if timed_out or error is not None:
+            return
+
+        state_change, current_state, _ = pipeline.get_state(5 * Gst.SECOND)
+        if state_change == Gst.StateChangeReturn.FAILURE:
+            print(
+                f"[WARN]  Pipeline '{self._pipeline_id}' failed to reach NULL state "
+                f"(state={current_state.value_nick})"
+            )
+
+    def _set_element_state_with_timeout(
+        self,
+        element,
+        target_state: Gst.State,
+        timeout_seconds: float,
+        thread_name: str,
+        label: str,
+    ):
+        if element is None:
+            return False, None
+
+        result = {"returned": False, "error": None}
+
+        def _set_state():
+            try:
+                element.set_state(target_state)
+                result["returned"] = True
+            except Exception as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(
+            target=_set_state,
+            name=thread_name,
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=timeout_seconds)
+
+        if worker.is_alive():
+            print(
+                f"[WARN]  {label} set_state({target_state.value_nick}) timed out "
+                f"after {timeout_seconds:.1f}s",
+                flush=True,
+            )
+            return True, None
+
+        if result["error"] is not None:
+            return False, result["error"]
+
+        return False, None
+
+    def _detach_capture_branch(self):
+        if self._capture_branch_pad is None or self._capture_bin_sink_pad is None:
+            return
+
+        try:
+            if self._capture_branch_pad.is_linked():
+                self._capture_branch_pad.unlink(self._capture_bin_sink_pad)
+            if self._post_tee is not None:
+                self._post_tee.release_request_pad(self._capture_branch_pad)
+        except Exception:
+            pass
+        finally:
+            self._capture_branch_pad = None
+            self._capture_bin_sink_pad = None
+
+    def _remove_probe(self, pad, probe_attr: str):
+        probe_id = getattr(self, probe_attr)
+        if not probe_id or pad is None:
+            return
+
+        pad.remove_probe(probe_id)
+        setattr(self, probe_attr, None)
+
+    def _release_streammux_pad(self):
+        if self.streammux is None or self._streammux_sink_pad is None:
+            return
+
+        try:
+            self.streammux.release_request_pad(self._streammux_sink_pad)
+        except Exception:
+            pass
+        finally:
+            self._streammux_sink_pad = None
+
+    def _clear_runtime_references(self):
+        self._pipeline = None
+        self._capture_appsink = None
+        self._capture_bin = None
+        self._capture_bin_sink_pad = None
+        self._capture_branch_pad = None
+        self._post_tee = None
+        self._osd_pad = None
+        self._osd_probe_id = None
+        self._rtmp_sink_pad = None
+        self._first_frame_probe_id = None
+        self._streammux_sink_pad = None
+        self._first_frame_sent = False
+
+    def _build_capture_bin(self):
+        capture_bin = Gst.Bin.new("live-capture-bin")
+
+        capture_queue = Gst.ElementFactory.make("queue", "capture-queue")
+        capture_conv = Gst.ElementFactory.make("nvvideoconvert", "capture-convert")
+        capture_caps = Gst.ElementFactory.make("capsfilter", "capture-caps")
+        capture_caps.set_property("caps", Gst.Caps.from_string("video/x-raw, format=RGBA"))
+        capture_appsink = Gst.ElementFactory.make("appsink", "capture-appsink")
+        capture_appsink.set_property("emit-signals", True)
+        capture_appsink.set_property("sync", False)
+        capture_appsink.set_property("max-buffers", 30)
+        capture_appsink.set_property("drop", True)
+        capture_appsink.connect("new-sample", self._on_new_sample)
+
+        for elem in [capture_queue, capture_conv, capture_caps, capture_appsink]:
+            if elem is None:
+                raise RuntimeError("Failed to create live capture branch elements")
+            capture_bin.add(elem)
+
+        if not capture_queue.link(capture_conv):
+            raise RuntimeError("Failed to link live capture queue to converter")
+        if not capture_conv.link(capture_caps):
+            raise RuntimeError("Failed to link live capture converter to caps")
+        if not capture_caps.link(capture_appsink):
+            raise RuntimeError("Failed to link live capture caps to appsink")
+
+        sink_pad = capture_queue.get_static_pad("sink")
+        ghost_pad = Gst.GhostPad.new("sink", sink_pad)
+        capture_bin.add_pad(ghost_pad)
+
+        self._capture_appsink = capture_appsink
+
+        return capture_bin
     
     def get_metadata(self) -> Dict:
         return {
