@@ -2,6 +2,7 @@ import threading
 import traceback
 from typing import Dict, List, Optional
 
+from ..deepstream_pipeline.constant import SOURCE_STATUS_DISCONNECTED
 from ..pipeline_sync_notifier.pipeline_sync_notifier_interface import PipelineSyncNotifierInterface
 from ...models.worker_source_pipeline import WorkerSourcePipelineEntity
 from ...repositories.AIModelRepository import AIModelRepository
@@ -146,7 +147,7 @@ class PipelineSyncService:
             "type": "new",
             "reasons": ["pipeline_created"],
             "requires_restart": False,
-            "source_stopped": source_status == "stopped",
+            "source_stopped": source_status == SOURCE_STATUS_DISCONNECTED,
             "status_only": False,
         }
 
@@ -196,7 +197,7 @@ class PipelineSyncService:
             "type": "updated",
             "reasons": reasons,
             "requires_restart": requires_restart,
-            "source_stopped": source_status == "stopped",
+            "source_stopped": source_status == SOURCE_STATUS_DISCONNECTED,
             "status_only": status_only,
         }
 

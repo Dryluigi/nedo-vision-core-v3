@@ -1,5 +1,6 @@
 from .BaseRepository import BaseRepository
 from ..models.worker_source import WorkerSourceEntity
+from ..modules.deepstream_pipeline.constant import SOURCE_STATUS_CONNECTED
 
 class WorkerSourceRepository(BaseRepository):
     def __init__(self):
@@ -52,4 +53,4 @@ class WorkerSourceRepository(BaseRepository):
         if not source:
             return False
         
-        return source.status_code == "connected" if source.status_code else False
+        return source.status_code == SOURCE_STATUS_CONNECTED if source.status_code else False

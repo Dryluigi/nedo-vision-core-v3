@@ -7,7 +7,13 @@ from ..pipeline_sync_service.pipeline_sync_service import PipelineSyncService
 from ..source_sync_notifier.source_sync_notifier_interface import SourceSyncNotifierInterface
 from ..deepstream_pipeline.file_deepstream_pipeline import FileDeepstreamPipeline
 from ..deepstream_pipeline.live_deepstream_pipeline import LiveRtspDeepstreamPipeline
-from ..deepstream_pipeline.constant import PIPELINE_STATUS_RUNNING, PIPELINE_STATUS_STARTING, PIPELINE_STATUS_STOPPED, PIPELINE_STATUS_STOPPING
+from ..deepstream_pipeline.constant import (
+    PIPELINE_STATUS_RUNNING,
+    PIPELINE_STATUS_STARTING,
+    PIPELINE_STATUS_STOPPED,
+    PIPELINE_STATUS_STOPPING,
+    SOURCE_STATUS_DISCONNECTED,
+)
 from ..triton_model_manager.triton_model_manager import TritonModelManager
 from ..triton_model_converter.rfdetr_artifact_layout import get_rfdetr_infer_config_path
 from ..deepstream_pipeline.person_attribute_aggregator import PersonAttributeAggregator
@@ -58,8 +64,8 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         if not source:
             print(f"Cannot start pipeline {pipeline_id}: source not found")
             return
-        if (source.status_code or "").strip().lower() == "stopped":
-            print(f"Skipping start for pipeline {pipeline_id}: source is stopped")
+        if (source.status_code or "").strip().lower() == SOURCE_STATUS_DISCONNECTED:
+            print(f"Skipping start for pipeline {pipeline_id}: source is disconnected")
             return
 
         output_width, output_height = self._parse_resolution(
@@ -197,7 +203,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
         active_pipeline_status = pipeline_metadata["pipeline_status"]
 
         if source_stopped:
-            print(f"Stopping pipeline {pipeline.id}: source is stopped")
+            print(f"Stopping pipeline {pipeline.id}: source is disconnected")
             self.stop(pipeline.id)
             self._pipeline_sync_service.update_pipeline_status(updated_pipeline_id, PIPELINE_STATUS_STOPPED)
             return
@@ -251,7 +257,7 @@ class PipelineExecutor(PipelineExecutorInterface, PipelineSyncNotifierInterface,
             snapshot = self._pipeline_sync_service.get_pipeline_snapshot(new_pipeline_id)
         source_status = (((snapshot or {}).get("source") or {}).get("status_code") or "").strip().lower()
 
-        if source_status == "stopped":
+        if source_status == SOURCE_STATUS_DISCONNECTED:
             self._pipeline_sync_service.update_pipeline_status(new_pipeline_id, PIPELINE_STATUS_STOPPED)
             return
 
